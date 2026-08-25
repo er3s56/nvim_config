@@ -1095,6 +1095,22 @@ local function mouse_hits_panel_line(state, mouse)
   return position.row > 0 and mouse.screenrow == position.row
 end
 
+local function queue_terminal_insert(win)
+  if not win or win < 1 or not vim.api.nvim_win_is_valid(win) then
+    return
+  end
+  local buf = vim.api.nvim_win_get_buf(win)
+  if vim.bo[buf].buftype ~= "terminal" or vim.bo[buf].filetype ~= "snacks_terminal" then
+    return
+  end
+  vim.schedule(function()
+    if vim.api.nvim_win_is_valid(win) and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_win_get_buf(win) == buf then
+      vim.api.nvim_set_current_win(win)
+      vim.cmd.startinsert()
+    end
+  end)
+end
+
 local function mouse_panel_target()
   local mouse = vim.fn.getmousepos()
   for buf, state in pairs(states) do
@@ -1104,6 +1120,7 @@ local function mouse_panel_target()
       return state, mouse
     end
   end
+  return nil, mouse
 end
 
 local function mouse_preview_target()
@@ -1159,6 +1176,7 @@ local function setup_global_mouse_mappings()
         end)
         return ""
       end
+      queue_terminal_insert(mouse and mouse.winid)
       return key
     end, { expr = true, silent = true, desc = "Toggle or open Git panel item" })
   end
@@ -1541,8 +1559,8 @@ function M.open(explorer, root, attempt)
   for _, lhs in ipairs({ "<LeftMouse>", "<2-LeftMouse>", "<3-LeftMouse>", "<4-LeftMouse>" }) do
     local key = lhs
     vim.keymap.set({ "n", "x" }, key, function()
-      local mouse = panel_mouse()
-      if mouse then
+      local mouse = vim.fn.getmousepos()
+      if mouse_in_panel_content(state, mouse) then
         -- An <expr> mapping runs under textlock. Moving the cursor/window here
         -- is illegal on some Neovim versions, so do the panel-local part as
         -- soon as the current input event has finished instead.
@@ -1553,6 +1571,7 @@ function M.open(explorer, root, attempt)
         end)
         return ""
       end
+      queue_terminal_insert(mouse.winid)
       return key
     end, {
       buffer = buf,
@@ -1675,6 +1694,17 @@ local function queue_refresh(buf)
 end
 
 local group = vim.api.nvim_create_augroup("project_git_panel_refresh", { clear = true })
+vim.api.nvim_create_autocmd("WinEnter", {
+  group = group,
+  callback = function()
+    -- Snacks starts insert mode directly from BufEnter. When a mouse click
+    -- leaves a prompt/Insert-mode window, the remainder of that input event
+    -- can switch the terminal back to Terminal-Normal ("nt") afterwards.
+    -- Run once the window transition is complete so one click is enough to
+    -- focus the project terminal and send subsequent keys to its job.
+    queue_terminal_insert(vim.api.nvim_get_current_win())
+  end,
+})
 vim.api.nvim_create_autocmd("VimResized", {
   group = group,
   callback = function()
