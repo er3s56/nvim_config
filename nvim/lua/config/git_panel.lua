@@ -500,48 +500,99 @@ local function entry_key(entry)
   }, "\0")
 end
 
-local function scroll_diff_with_mouse(state, direction)
+local function diff_edge_filler(win, direction)
+  if not win or not vim.api.nvim_win_is_valid(win) then
+    return math.huge
+  end
+  return vim.api.nvim_win_call(win, function()
+    local line = direction > 0 and vim.api.nvim_buf_line_count(0) + 1 or 1
+    return vim.fn.diff_filler(line)
+  end)
+end
+
+-- Use the side that has real text at the edge we are moving towards. For an
+-- added file that is the After side; for a deleted file it is the Before
+-- side. Driving scrollbind from a filler-only edge makes Neovim remember an
+-- offset past EOF and can leave almost the whole comparison blank.
+local function diff_scroll_anchor(layout, direction, hovered_win)
+  local best
+  for _, win in ipairs({ layout.main_win, layout.after_win }) do
+    if vim.api.nvim_win_is_valid(win) then
+      local candidate = {
+        win = win,
+        filler = diff_edge_filler(win, direction),
+        hovered = win == hovered_win and 1 or 0,
+        lines = vim.api.nvim_buf_line_count(vim.api.nvim_win_get_buf(win)),
+      }
+      if
+        not best
+        or candidate.filler < best.filler
+        or (candidate.filler == best.filler and candidate.hovered > best.hovered)
+        or (candidate.filler == best.filler and candidate.hovered == best.hovered and candidate.lines > best.lines)
+      then
+        best = candidate
+      end
+    end
+  end
+  return best and best.win
+end
+
+local function diff_scroll_capacity(win, direction)
+  return vim.api.nvim_win_call(win, function()
+    if direction > 0 then
+      -- Stop as soon as EOF becomes visible. Native <C-E> and mouse-wheel
+      -- scrolling allow the final line to reach the top of the window, which
+      -- makes a long file appear to disappear into an empty viewport.
+      return math.max(vim.api.nvim_buf_line_count(0) - vim.fn.line("w$"), 0)
+    end
+    return math.max(vim.fn.line("w0") - 1, 0)
+  end)
+end
+
+local function diff_scroll_rhs(state, direction)
   local layout = state.preview_layout
-  if not layout then
-    return
+  if
+    not layout
+    or not vim.api.nvim_win_is_valid(layout.main_win)
+    or not vim.api.nvim_win_is_valid(layout.after_win)
+  then
+    return ""
   end
 
   local mouse = vim.fn.getmousepos()
-  local target = mouse.winid
-  if target ~= layout.main_win and target ~= layout.after_win then
-    target = vim.api.nvim_get_current_win()
+  local anchor = diff_scroll_anchor(layout, direction, mouse.winid)
+  if not anchor then
+    return ""
   end
-  if (target ~= layout.main_win and target ~= layout.after_win) or not vim.api.nvim_win_is_valid(target) then
-    return
+  local amount = tonumber(vim.o.mousescroll:match("ver:(%d+)")) or 3
+  local steps = math.min(amount, diff_scroll_capacity(anchor, direction))
+  if steps < 1 then
+    return ""
   end
 
-  -- Mouse scrolling can operate on a non-current window, which bypasses
-  -- scrollbind. Applying :syncbind afterwards is also unreliable around diff
-  -- filler: one side can move twelve screen rows while the other moves three.
-  -- Scroll both views by the same screen-row amount with binding temporarily
-  -- disabled, then restore binding without stealing focus.
-  local amount = tonumber(vim.o.mousescroll:match("ver:(%d+)")) or 3
-  local key = vim.api.nvim_replace_termcodes(direction > 0 and "<C-E>" or "<C-Y>", true, false, true)
-  local windows = { layout.main_win, layout.after_win }
-  state.suppressing_scroll = true
-  for _, win in ipairs(windows) do
-    vim.wo[win].scrollbind = false
+  local keys = (direction > 0 and "<C-E>" or "<C-Y>"):rep(steps)
+  local current_win = vim.api.nvim_get_current_win()
+  local mode = vim.api.nvim_get_mode().mode
+  local leave_mode, restore_mode = "", ""
+  if mode:sub(1, 1) == "i" then
+    leave_mode, restore_mode = "<Esc>", "i"
+  elseif mode:sub(1, 1) == "t" then
+    leave_mode, restore_mode = "<C-\\><C-N>", "i"
+  elseif mode == "v" or mode == "V" or mode == "\22" then
+    leave_mode, restore_mode = "<Esc>", "gv"
   end
-  for _, win in ipairs(windows) do
-    pcall(vim.api.nvim_win_call, win, function()
-      vim.cmd("normal! " .. amount .. key)
-    end)
+
+  if current_win == anchor then
+    return leave_mode .. keys .. restore_mode
   end
-  for _, win in ipairs(windows) do
-    if vim.api.nvim_win_is_valid(win) then
-      vim.wo[win].scrollbind = true
-    end
-  end
-  vim.defer_fn(function()
-    if valid(state) then
-      state.suppressing_scroll = false
-    end
-  end, 30)
+  -- An expression mapping cannot change windows under textlock. Return real
+  -- input commands instead: briefly make the anchor current so scrollbind is
+  -- honoured, execute each screen-row scroll, then restore the user's focus.
+  return leave_mode
+    .. ("<Cmd>noautocmd call win_gotoid(%d)<CR>"):format(anchor)
+    .. keys
+    .. ("<Cmd>noautocmd call win_gotoid(%d)<CR>"):format(current_win)
+    .. restore_mode
 end
 
 local function find_editor_window(state)
@@ -855,11 +906,23 @@ local function show_preview(state, entry, key, before, after, before_label, afte
 
   for _, buf in ipairs(preview.bufs) do
     vim.keymap.set("n", "<ScrollWheelDown>", function()
-      scroll_diff_with_mouse(state, 1)
-    end, { buffer = buf, silent = true, desc = "Scroll both Git diff windows down" })
+      return diff_scroll_rhs(state, 1)
+    end, {
+      buffer = buf,
+      expr = true,
+      replace_keycodes = true,
+      silent = true,
+      desc = "Scroll both Git diff windows down",
+    })
     vim.keymap.set("n", "<ScrollWheelUp>", function()
-      scroll_diff_with_mouse(state, -1)
-    end, { buffer = buf, silent = true, desc = "Scroll both Git diff windows up" })
+      return diff_scroll_rhs(state, -1)
+    end, {
+      buffer = buf,
+      expr = true,
+      replace_keycodes = true,
+      silent = true,
+      desc = "Scroll both Git diff windows up",
+    })
   end
   vim.api.nvim_create_autocmd({ "BufDelete", "BufWipeout" }, {
     once = true,
@@ -1203,15 +1266,15 @@ local function setup_global_mouse_mappings()
     vim.keymap.set({ "n", "x", "i", "t" }, key, function()
       local state = mouse_preview_target()
       if state then
-        vim.schedule(function()
-          if valid(state) then
-            scroll_diff_with_mouse(state, scroll_direction)
-          end
-        end)
-        return ""
+        return diff_scroll_rhs(state, scroll_direction)
       end
       return key
-    end, { expr = true, silent = true, desc = "Scroll both Git diff windows" })
+    end, {
+      expr = true,
+      replace_keycodes = true,
+      silent = true,
+      desc = "Scroll both Git diff windows",
+    })
   end
 end
 
