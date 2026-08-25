@@ -329,6 +329,8 @@ local function capture_editor_context(win, buf)
       cursorbind = vim.wo[win].cursorbind,
       cursorline = vim.wo[win].cursorline,
       foldenable = vim.wo[win].foldenable,
+      number = vim.wo[win].number,
+      relativenumber = vim.wo[win].relativenumber,
       scrollbind = vim.wo[win].scrollbind,
       winbar = vim.wo[win].winbar,
       wrap = vim.wo[win].wrap,
@@ -418,7 +420,6 @@ local function hide_preview(state, target_buf, restore_original)
   state.preview = nil
   state.preview_layout = nil
   state.updating_preview = false
-  state.suppressing_scroll = false
 end
 
 local function delete_preview(state, preview)
@@ -832,6 +833,8 @@ activate_preview = function(state, preview, focus_preview)
     vim.wo[item.win].foldenable = false
     vim.wo[item.win].wrap = false
     vim.wo[item.win].cursorline = true
+    vim.wo[item.win].number = true
+    vim.wo[item.win].relativenumber = false
     vim.wo[item.win].scrollbind = true
     vim.wo[item.win].cursorbind = false
     vim.wo[item.win].winbar = "  " .. item.label
@@ -864,12 +867,6 @@ activate_preview = function(state, preview, focus_preview)
   end
 
   state.updating_preview = false
-  state.suppressing_scroll = true
-  vim.defer_fn(function()
-    if state.preview == preview then
-      state.suppressing_scroll = false
-    end
-  end, 30)
 end
 
 local function show_preview(state, entry, key, before, after, before_label, after_label, focus_preview)
@@ -1257,6 +1254,11 @@ local function setup_global_mouse_mappings()
     return mouse_panel_target() and "" or "<LeftRelease>"
   end, { expr = true, silent = true, desc = "Finish Git panel click" })
 
+  -- This is also the synchronisation path when the mouse is over a diff that
+  -- does not own focus. Do not add a WinScrolled callback that enters the
+  -- source window with nvim_win_call(): Snacks can then re-evaluate its main
+  -- window and tear down the diff layout while a wheel event is still being
+  -- processed. diff_scroll_rhs() uses noautocmd window changes instead.
   for lhs, direction in pairs({
     ["<ScrollWheelDown>"] = 1,
     ["<ScrollWheelUp>"] = -1,
@@ -1862,41 +1864,6 @@ vim.api.nvim_create_autocmd("BufEnter", {
             end)
           end
         end
-      end
-    end
-  end,
-})
-
--- Mouse wheels can scroll a hovered non-current window without triggering its
--- buffer-local mapping. Synchronise again after any preview window scrolls so
--- both sides stay aligned regardless of which panel currently has focus.
-vim.api.nvim_create_autocmd("WinScrolled", {
-  group = group,
-  callback = function(event)
-    local source_win = tonumber(event.match)
-    if not source_win or not vim.api.nvim_win_is_valid(source_win) then
-      return
-    end
-    for _, state in pairs(states) do
-      local layout = state.preview_layout
-      if
-        layout
-        and not state.syncing_scroll
-        and not state.suppressing_scroll
-        and (source_win == layout.main_win or source_win == layout.after_win)
-        and vim.api.nvim_win_is_valid(layout.main_win)
-        and vim.api.nvim_win_is_valid(layout.after_win)
-      then
-        state.syncing_scroll = true
-        pcall(vim.api.nvim_win_call, source_win, function()
-          vim.wo[layout.main_win].scrollbind = true
-          vim.wo[layout.after_win].scrollbind = true
-          vim.cmd("syncbind")
-        end)
-        local synced_state = state
-        vim.schedule(function()
-          synced_state.syncing_scroll = false
-        end)
       end
     end
   end,
