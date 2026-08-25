@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/jesseduffield/lazygit/master/schema/config.json
+
+gui:
+  # 给左右并排的 diff 留出更多宽度；在 Lazygit 中按 + 还可以继续放大。
+  sidePanelWidth: 0.2
+
+git:
+  # 默认展开完整文件。这个设置也会作用于提交/目录的整体预览。
+  diffContextSize: 999999
+
+  diffRenderers:
+    # 默认：在 Lazygit 预览区左右并排显示修改前、修改后的内容。
+    - name: side-by-side
+      command: delta --paging=never --side-by-side --line-numbers
+
+    # 在 Lazygit 中按 | 可以临时切回 Git 原始 diff。
+    - type: rawGit
+      name: default
