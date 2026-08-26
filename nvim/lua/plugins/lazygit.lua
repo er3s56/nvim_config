@@ -116,6 +116,7 @@ return {
     },
     opts = function(_, opts)
       opts.options = opts.options or {}
+      opts.options.always_show_bufferline = true
       -- Keep Bufferline's scheduled command path so real mouse clicks also
       -- trigger its normal UI refresh after the central editor is updated.
       opts.options.left_mouse_command = "PanelBufferOpen %d"

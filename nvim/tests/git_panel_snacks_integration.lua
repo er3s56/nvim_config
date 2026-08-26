@@ -2,6 +2,9 @@ local ContextMenu = require("config.context_menu")
 local GitPanel = require("config.git_panel")
 
 assert(rawget(_G, "Snacks") and Snacks.picker, "Snacks must be loaded by the real config")
+local bufferline_config = require("bufferline.config").get()
+assert(bufferline_config, "Bufferline must be loaded by the real config")
+assert(bufferline_config.options.always_show_bufferline == true, "Bufferline hides the final buffer tab")
 
 local root = vim.fn.tempname()
 local relative = "src/deep/file.txt"
