@@ -1,3 +1,5 @@
+local ContextMenu = require("config.context_menu")
+
 local M = {}
 
 local states = {}
@@ -24,13 +26,32 @@ local function run_git(root, args, callback, text)
   run(cmd, callback, text)
 end
 
-local function shorten(path, width)
-  local text = vim.fn.pathshorten(path)
-  local available = math.max(width - 9, 10)
-  if vim.fn.strdisplaywidth(text) <= available then
+local function display_path(path, width)
+  local text = (path or ""):gsub("[\r\n]", " ")
+  width = math.max(width or 0, 0)
+  if width == 0 then
+    return ""
+  end
+  if vim.fn.strdisplaywidth(text) <= width then
     return text
   end
-  return "…" .. vim.fn.strcharpart(text, math.max(vim.fn.strchars(text) - available + 1, 0))
+  if width == 1 then
+    return "…"
+  end
+
+  local budget = width - 1
+  local start = vim.fn.strchars(text)
+  local used = 0
+  while start > 0 do
+    local char = vim.fn.strcharpart(text, start - 1, 1)
+    local char_width = vim.fn.strdisplaywidth(char)
+    if char_width > 0 and used + char_width > budget then
+      break
+    end
+    used = used + char_width
+    start = start - 1
+  end
+  return "…" .. vim.fn.strcharpart(text, start)
 end
 
 local function truncate(text, width)
@@ -81,7 +102,12 @@ local function render(state)
       add("    ✓ Working tree clean", "DiagnosticOk")
     else
       for _, item in ipairs(state.changes) do
-        add(("  %-2s %s"):format(item.status, shorten(item.path, width)), status_hl(item.status), item)
+        local prefix = ("  %-2s "):format(item.status)
+        add(
+          prefix .. display_path(item.path, math.max(width - vim.fn.strdisplaywidth(prefix), 1)),
+          status_hl(item.status),
+          item
+        )
       end
     end
   end
@@ -119,7 +145,12 @@ local function render(state)
           add("      No changed files", "Comment")
         else
           for _, file in ipairs(cached.files) do
-            add(("    %-4s %s"):format(file.status, shorten(file.path, width - 2)), status_hl(file.status), file)
+            local prefix = ("    %-4s "):format(file.status)
+            add(
+              prefix .. display_path(file.path, math.max(width - vim.fn.strdisplaywidth(prefix), 1)),
+              status_hl(file.status),
+              file
+            )
           end
         end
       end
@@ -885,7 +916,7 @@ local function show_preview(state, entry, key, before, after, before_label, afte
   state.preview_serial = state.preview_serial + 1
   local serial = state.preview_serial
   local source = entry.kind == "commit_file" and entry.short_hash or "CHANGES"
-  local path_label = vim.fn.pathshorten(entry.path):gsub("/", "›"):gsub("[\r\n]", " ")
+  local path_label = entry.path:gsub("/", "›"):gsub("[\r\n]", " ")
   local tab_label = ("Δ %s · %s"):format(path_label, source)
   local before_name = ("git-preview://%d/%d/before/%s"):format(state.buf, serial, path_label)
   local after_name = ("git-diff://%d/%d/%s"):format(state.buf, serial, tab_label)
@@ -1204,7 +1235,7 @@ local function position_panel_mouse(state, mouse)
   local mode = vim.api.nvim_get_mode().mode
   if mode == "v" or mode == "V" or mode == "\22" then
     vim.cmd("normal! \027")
-  elseif mode:sub(1, 1) == "i" then
+  elseif mode:sub(1, 1) == "i" or mode:sub(1, 1) == "t" then
     vim.cmd("stopinsert")
   end
   vim.api.nvim_set_current_win(state.win)
@@ -1213,6 +1244,107 @@ local function position_panel_mouse(state, mouse)
   end
   vim.api.nvim_win_set_cursor(state.win, { mouse.line, 0 })
   return true
+end
+
+local function workspace_path(state, entry)
+  if not (state and state.root and entry and entry.path) then
+    return
+  end
+  return vim.fs.normalize(vim.fs.joinpath(state.root, entry.path))
+end
+
+local function workspace_file_exists(path)
+  local stat = path and vim.uv.fs_stat(path) or nil
+  return stat ~= nil and stat.type == "file"
+end
+
+local function notify_missing_workspace_file(entry)
+  local message = ("Workspace file does not exist: `%s`"):format(entry.path)
+  if rawget(_G, "Snacks") and Snacks.notify then
+    Snacks.notify.warn(message)
+  else
+    vim.notify(message, vim.log.levels.WARN)
+  end
+end
+
+local function open_workspace_file(state, entry)
+  local path = workspace_path(state, entry)
+  if not workspace_file_exists(path) then
+    notify_missing_workspace_file(entry)
+    return false
+  end
+
+  local buf = vim.fn.bufadd(path)
+  local loaded, load_error = pcall(vim.fn.bufload, buf)
+  if not loaded then
+    local message = ("Failed to open workspace file `%s`: %s"):format(entry.path, tostring(load_error))
+    if rawget(_G, "Snacks") and Snacks.notify then
+      Snacks.notify.error(message)
+    else
+      vim.notify(message, vim.log.levels.ERROR)
+    end
+    return false
+  end
+  -- Recheck after loading so a file removed between the menu click and buffer
+  -- creation never turns into an empty, misleading editor buffer.
+  if not workspace_file_exists(path) then
+    notify_missing_workspace_file(entry)
+    return false
+  end
+
+  M.open_buffer(buf)
+  return true
+end
+
+local function workspace_context_entries(state, entry)
+  return {
+    {
+      label = "Open File",
+      enabled = workspace_file_exists(workspace_path(state, entry)),
+      action = function()
+        open_workspace_file(state, entry)
+      end,
+    },
+  }
+end
+
+local function context_entry_at_mouse(state, mouse)
+  if not mouse_hits_panel_line(state, mouse) then
+    return
+  end
+  local entry = state.entries[mouse.line]
+  if entry and (entry.kind == "worktree_file" or entry.kind == "commit_file") then
+    return entry
+  end
+end
+
+local context_menu_registered = false
+
+local function setup_context_menu()
+  if context_menu_registered then
+    return
+  end
+  context_menu_registered = true
+  ContextMenu.setup()
+  ContextMenu.register("git_panel", function(mouse)
+    for buf, state in pairs(states) do
+      if not valid(state) then
+        states[buf] = nil
+      else
+        local entry = context_entry_at_mouse(state, mouse)
+        if entry then
+          vim.schedule(function()
+            if valid(state) and position_panel_mouse(state, mouse) then
+              ContextMenu.open(workspace_context_entries(state, entry), mouse, {
+                filetype = "git_panel_context_menu",
+              })
+            end
+          end)
+          return true
+        end
+      end
+    end
+  end)
 end
 
 -- Buffer-local mappings are only resolved from the window that owned focus
@@ -1599,6 +1731,7 @@ function M.open(explorer, root, attempt)
     preview_generation = 0,
   }
   states[buf] = state
+  setup_context_menu()
   setup_global_mouse_mappings()
 
   local function map(lhs, rhs, desc)
@@ -1868,5 +2001,12 @@ vim.api.nvim_create_autocmd("BufEnter", {
     end
   end,
 })
+
+M._display_path = display_path
+M._render = render
+M._workspace_path = workspace_path
+M._workspace_context_entries = workspace_context_entries
+M._open_workspace_file = open_workspace_file
+M._context_entry_at_mouse = context_entry_at_mouse
 
 return M

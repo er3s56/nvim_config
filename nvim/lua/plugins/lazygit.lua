@@ -10,6 +10,7 @@ return {
   {
     "folke/snacks.nvim",
     init = function()
+      require("config.explorer_menu").setup()
       local commands = {
         PanelOpen = { "open_all_panels", "Restore all default project panels" },
         PanelClose = { "close_current_panel", "Close the project panel under the cursor" },
@@ -34,6 +35,14 @@ return {
       })
     end,
     opts = {
+      picker = {
+        sources = {
+          explorer = {
+            hidden = true,
+            ignored = true,
+          },
+        },
+      },
       terminal = {
         win = {
           keys = {
