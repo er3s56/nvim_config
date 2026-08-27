@@ -47,6 +47,15 @@ return {
         win = {
           keys = {
             q = { function() end, desc = "Disabled in project panels" },
+            -- Keep terminal keyboard input transparent. Panel selection is
+            -- mouse-driven, so shell/TUI programs should receive every key.
+            nav_h = false,
+            nav_j = false,
+            nav_k = false,
+            nav_l = false,
+            hide_slash = false,
+            hide_underscore = false,
+            term_normal = false,
           },
         },
       },

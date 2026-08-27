@@ -66,6 +66,10 @@ end
 
 local ok, test_error = pcall(function()
   local first = assert(TerminalTabs.new(root, false))
+  assert(
+    vim.tbl_isempty(vim.api.nvim_buf_get_keymap(first.buf, "t")),
+    "project terminals should not intercept terminal-mode keyboard input"
+  )
   vim.b[first.buf].term_title = "one"
   local second = assert(TerminalTabs.new(root, false))
   vim.b[second.buf].term_title = "two"
