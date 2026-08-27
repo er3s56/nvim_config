@@ -1,4 +1,6 @@
 local ContextMenu = require("config.context_menu")
+local PanelLayout = require("config.panel_layout")
+local TerminalTabs = require("config.terminal_tabs")
 
 local M = {}
 
@@ -7,6 +9,11 @@ local ns = vim.api.nvim_create_namespace("project_git_panel")
 local resize_generation = 0
 local reflowing_layout = false
 local explorer_preferred_widths = setmetatable({}, { __mode = "k" })
+local git_panel_placements = {}
+
+local function placement_key(root, tab)
+  return root .. "\0" .. tostring(tab)
+end
 
 local function valid(state)
   return state and vim.api.nvim_buf_is_valid(state.buf) and vim.api.nvim_win_is_valid(state.win)
@@ -403,6 +410,18 @@ local function hide_preview(state, target_buf, restore_original)
 
   state.updating_preview = true
   save_preview_views(state)
+  local active_preview = state.preview
+  if
+    active_preview
+    and not active_preview.deleting
+    and vim.api.nvim_win_is_valid(layout.main_win)
+    and vim.api.nvim_win_is_valid(layout.after_win)
+  then
+    active_preview.layout_placement = {
+      snapshot = PanelLayout.capture(layout.after_win),
+      after_win = layout.after_win,
+    }
+  end
   for _, win in ipairs({ layout.main_win, layout.after_win }) do
     if win and vim.api.nvim_win_is_valid(win) then
       pcall(vim.api.nvim_win_call, win, function()
@@ -686,7 +705,7 @@ function M.reflow_layout()
       if not valid(state) then
         states[buf] = nil
       else
-        local explorer_root = state.explorer.layout and state.explorer.layout.root
+        local explorer_root = state.explorer and state.explorer.layout and state.explorer.layout.root
         if explorer_root and explorer_root:valid() then
           -- Depending on which async panel becomes ready first, the bottom
           -- terminal can span the full editor or only the right-hand editor
@@ -703,7 +722,7 @@ function M.reflow_layout()
           if vim.api.nvim_win_is_valid(state.win) then
             vim.wo[state.win].winfixheight = true
           end
-          if state.explorer.layout and state.explorer.layout:valid() then
+          if state.explorer and state.explorer.layout and state.explorer.layout:valid() then
             state.explorer.layout:update()
           end
         end
@@ -751,6 +770,18 @@ local function queue_layout_reflow(delay)
     end
   end, delay or 60)
 end
+
+TerminalTabs.setup({
+  root = function()
+    return LazyVim.root()
+  end,
+  on_layout_change = function()
+    queue_layout_reflow(80)
+  end,
+  on_layout_cancel = function()
+    resize_generation = resize_generation + 1
+  end,
+})
 
 activate_preview = function(state, preview, focus_preview)
   if not valid(state) or not valid_preview(preview) then
@@ -817,6 +848,7 @@ activate_preview = function(state, preview, focus_preview)
       local fallback = vim.api.nvim_create_buf(true, false)
       editor_context = capture_editor_context(main_win, fallback)
     end
+    assert(editor_context, "Git preview editor context could not be captured")
 
     vim.api.nvim_win_set_buf(main_win, preview.bufs[1])
     local total_width = vim.api.nvim_win_get_width(main_win)
@@ -869,6 +901,15 @@ activate_preview = function(state, preview, focus_preview)
     vim.wo[item.win].scrollbind = true
     vim.wo[item.win].cursorbind = false
     vim.wo[item.win].winbar = "  " .. item.label
+  end
+
+  local placement = preview.layout_placement
+  if placement then
+    local restored = PanelLayout.restore(placement.snapshot, { [placement.after_win] = layout.after_win })
+    preview.layout_placement = nil
+    if restored then
+      resize_generation = resize_generation + 1
+    end
   end
 
   pcall(vim.api.nvim_win_call, layout.after_win, function()
@@ -1418,6 +1459,11 @@ function M.close()
     return
   end
   close_preview(state)
+  local tab = vim.api.nvim_win_get_tabpage(state.win)
+  git_panel_placements[placement_key(state.root, tab)] = {
+    snapshot = PanelLayout.capture(state.win),
+    panel_win = state.win,
+  }
   if vim.api.nvim_win_is_valid(state.win) then
     vim.api.nvim_win_close(state.win, true)
   end
@@ -1426,6 +1472,19 @@ end
 function M.close_explorer()
   for _, explorer in ipairs(Snacks.picker.get({ source = "explorer" })) do
     if not explorer.closed then
+      for _, state in pairs(states) do
+        if valid(state) and state.explorer == explorer then
+          local root = explorer.layout and explorer.layout.root
+          if root and root:valid() then
+            state.explorer_placement = {
+              snapshot = PanelLayout.capture(root.win),
+              explorer_win = root.win,
+              preferred_width = explorer_preferred_widths[explorer],
+            }
+            state.detaching_explorer = true
+          end
+        end
+      end
       explorer:close()
       return
     end
@@ -1433,6 +1492,12 @@ function M.close_explorer()
 end
 
 function M.close_terminal()
+  if TerminalTabs.hide() then
+    return
+  end
+
+  -- Keep the legacy fallback for non-project Snacks terminals. They remain
+  -- outside the tab controller and retain their existing PanelClose behavior.
   local current_buf = vim.api.nvim_get_current_buf()
   local fallback
   for _, terminal in ipairs(Snacks.terminal.list()) do
@@ -1474,11 +1539,16 @@ function M.close_current_panel()
 
   for _, explorer in ipairs(Snacks.picker.get({ source = "explorer" })) do
     if not explorer.closed and explorer_has_buffer(explorer, current_buf) then
-      explorer:close()
+      M.close_explorer()
       return
     end
   end
 
+  local managed, root = TerminalTabs.owns_buffer(current_buf)
+  if managed then
+    TerminalTabs.hide(root)
+    return
+  end
   for _, terminal in ipairs(Snacks.terminal.list()) do
     if terminal:buf_valid() and terminal.buf == current_buf then
       terminal:hide()
@@ -1566,8 +1636,76 @@ function M.cycle_buffer(direction)
   end)
 end
 
+local function watch_explorer_root(state, explorer)
+  local root = explorer and explorer.layout and explorer.layout.root
+  if not root or not root:valid() then
+    return
+  end
+  state.explorer_watch_generation = (state.explorer_watch_generation or 0) + 1
+  local generation = state.explorer_watch_generation
+  vim.api.nvim_create_autocmd("WinClosed", {
+    once = true,
+    pattern = tostring(root.win),
+    callback = function()
+      if state.explorer_watch_generation ~= generation then
+        return
+      end
+      if state.detaching_explorer then
+        state.detaching_explorer = false
+        if state.explorer == explorer then
+          state.explorer = nil
+        end
+        return
+      end
+      close_preview(state)
+      states[state.buf] = nil
+      if vim.api.nvim_win_is_valid(state.win) then
+        vim.api.nvim_win_close(state.win, true)
+      end
+    end,
+  })
+end
+
+local function attach_explorer(state, explorer, attempt)
+  if not state or not valid(state) or not explorer or explorer.closed then
+    return
+  end
+  attempt = attempt or 0
+  local root = explorer.layout and explorer.layout.root
+  if not root or not root:valid() then
+    if attempt < 20 then
+      vim.defer_fn(function()
+        attach_explorer(state, explorer, attempt + 1)
+      end, 50)
+    end
+    return
+  end
+
+  state.detaching_explorer = false
+  state.explorer = explorer
+  if state.editor_win and vim.api.nvim_win_is_valid(state.editor_win) then
+    explorer.main = state.editor_win
+  else
+    state.editor_win = explorer.main
+  end
+  watch_explorer_root(state, explorer)
+
+  local placement = state.explorer_placement
+  if placement then
+    local restored = PanelLayout.restore(placement.snapshot, { [placement.explorer_win] = root.win })
+    state.explorer_placement = nil
+    if restored then
+      resize_generation = resize_generation + 1
+      explorer_preferred_widths[explorer] = placement.preferred_width or vim.api.nvim_win_get_width(root.win)
+    else
+      queue_layout_reflow(80)
+    end
+  end
+end
+
 function M.open_explorer(focus)
   local root = LazyVim.root()
+  local state = current_state()
   local explorer = Snacks.picker.get({ source = "explorer" })[1]
   if not explorer then
     explorer = Snacks.explorer({ cwd = root })
@@ -1581,6 +1719,9 @@ function M.open_explorer(focus)
     and not explorer_preferred_widths[explorer]
   then
     explorer_preferred_widths[explorer] = vim.api.nvim_win_get_width(explorer.layout.root.win)
+  end
+  if state and state.explorer ~= explorer then
+    attach_explorer(state, explorer)
   end
 
   if focus ~= false and explorer and explorer.list and explorer.list.win then
@@ -1623,21 +1764,7 @@ function M.open_git_panel(focus)
 end
 
 function M.open_terminal(focus)
-  local terminal, created = Snacks.terminal.get(nil, {
-    cwd = LazyVim.root(),
-    win = {
-      position = "bottom",
-      height = 0.3,
-    },
-  })
-  if terminal and not created then
-    terminal:show()
-  end
-  if focus ~= false and terminal and terminal:win_valid() then
-    vim.api.nvim_set_current_win(terminal.win)
-  end
-  queue_layout_reflow(80)
-  return terminal
+  return TerminalTabs.open(LazyVim.root(), focus)
 end
 
 function M.open_all_panels()
@@ -1824,26 +1951,25 @@ function M.open(explorer, root, attempt)
       end)
     end,
   })
-  vim.api.nvim_create_autocmd("WinClosed", {
-    once = true,
-    pattern = tostring(explorer.layout.root.win),
-    callback = function()
-      close_preview(state)
-      states[buf] = nil
-      if vim.api.nvim_win_is_valid(win) then
-        vim.api.nvim_win_close(win, true)
-      end
-    end,
-  })
+  watch_explorer_root(state, explorer)
 
   explorer.layout:update()
   queue_layout_reflow(80)
+  local key = placement_key(root, vim.api.nvim_win_get_tabpage(win))
+  local placement = git_panel_placements[key]
+  if placement then
+    local restored = PanelLayout.restore(placement.snapshot, { [placement.panel_win] = win })
+    git_panel_placements[key] = nil
+    if restored then
+      resize_generation = resize_generation + 1
+    end
+  end
   -- Splitting the Explorer layout while its initial async finder is still
   -- publishing can make Snacks append the same batch twice. Detect that real
   -- UI race after startup and perform one clean finder refresh only when it
   -- actually occurred.
   vim.defer_fn(function()
-    if not valid(state) or not explorer.list or not explorer.list.items then
+    if not valid(state) or explorer.closed or not explorer.list or not explorer.list.items then
       return
     end
     local seen = {}

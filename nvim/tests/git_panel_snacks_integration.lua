@@ -19,6 +19,33 @@ local function git(args)
   assert(result.code == 0, result.stderr)
 end
 
+local function normalized_layout(node, replaced_win, label)
+  if node[1] == "leaf" then
+    return { "leaf", node[2] == replaced_win and label or node[2] }
+  end
+  local normalized = { node[1], {} }
+  for _, child in ipairs(node[2]) do
+    normalized[2][#normalized[2] + 1] = normalized_layout(child, replaced_win, label)
+  end
+  return normalized
+end
+
+local function window_geometry(replaced_win, label)
+  local geometry = {}
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    if vim.api.nvim_win_get_config(win).relative == "" then
+      local position = vim.api.nvim_win_get_position(win)
+      geometry[win == replaced_win and label or win] = {
+        row = position[1],
+        col = position[2],
+        width = vim.api.nvim_win_get_width(win),
+        height = vim.api.nvim_win_get_height(win),
+      }
+    end
+  end
+  return geometry
+end
+
 git({ "init", "-q" })
 git({ "config", "user.name", "Git Panel Test" })
 git({ "config", "user.email", "git-panel@example.invalid" })
@@ -108,6 +135,10 @@ local ok, test_error = pcall(function()
   local after_name = vim.api.nvim_buf_get_name(state.preview.bufs[2])
   assert(after_name:find("src›deep›file.txt", 1, true), "diff tab label proactively shortened the path")
   local diff_window_count = #vim.api.nvim_tabpage_list_wins(0)
+  local preview = state.preview
+  local old_after_win = state.preview_layout.after_win
+  local diff_layout = normalized_layout(vim.fn.winlayout(), old_after_win, "after")
+  local diff_geometry = window_geometry(old_after_win, "after")
 
   assert(GitPanel._open_workspace_file(state, entry), "context action did not open the workspace file")
   assert(state.preview_layout == nil, "opening the workspace file left the diff layout active")
@@ -117,6 +148,45 @@ local ok, test_error = pcall(function()
   )
   assert(vim.api.nvim_get_current_win() == state.editor_win, "workspace file did not focus the central editor")
   assert(vim.api.nvim_buf_get_name(0) == file, "central editor opened the wrong workspace path")
+
+  GitPanel.open_buffer(preview.bufs[2])
+  assert(
+    vim.wait(3000, function()
+      return state.preview_layout and vim.api.nvim_win_is_valid(state.preview_layout.after_win)
+    end),
+    "reopening a retained Git preview did not restore the diff layout"
+  )
+  assert(
+    vim.deep_equal(diff_layout, normalized_layout(vim.fn.winlayout(), state.preview_layout.after_win, "after")),
+    "reopening a Git preview changed the window tree"
+  )
+  assert(
+    vim.deep_equal(diff_geometry, window_geometry(state.preview_layout.after_win, "after")),
+    "reopening a Git preview changed window geometry"
+  )
+  assert(GitPanel._open_workspace_file(state, entry), "Git preview did not return to the workspace file")
+
+  local old_panel_win = state.win
+  local panel_layout = normalized_layout(vim.fn.winlayout(), old_panel_win, "git")
+  local panel_geometry = window_geometry(old_panel_win, "git")
+  GitPanel.close()
+  assert(not vim.api.nvim_win_is_valid(old_panel_win), "Git panel did not close before its restore test")
+  state = GitPanel.open(picker, root)
+  assert(state, "Git panel did not reopen")
+  assert(
+    vim.wait(3000, function()
+      return state.changes ~= nil and state.commits ~= nil
+    end),
+    "reopened Git panel did not finish loading"
+  )
+  assert(
+    vim.deep_equal(panel_layout, normalized_layout(vim.fn.winlayout(), state.win, "git")),
+    "closing and reopening the Git panel changed the window tree"
+  )
+  assert(
+    vim.deep_equal(panel_geometry, window_geometry(state.win, "git")),
+    "closing and reopening the Git panel changed window geometry"
+  )
 end)
 
 ContextMenu.close()
