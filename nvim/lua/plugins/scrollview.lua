@@ -22,6 +22,16 @@ return {
         "snacks_notif",
         "snacks_picker_input",
         "snacks_terminal",
+        -- Sidebar panels: scrollview refreshes its floats on its own deferred
+        -- schedule, 40-90ms behind a view switch, so a sidebar scrollbar pops
+        -- in, out, or twitches in height two frames after every switch. The
+        -- picker list already scrolls with the cursor and search, so the bar
+        -- adds little; the flicker costs more.
+        "snacks_picker_list",
+        "project_git_panel",
+        "activity_bar",
+        "activity_git_slot",
+        "activity_search_error",
       },
     },
   },
