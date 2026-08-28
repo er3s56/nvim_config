@@ -7,6 +7,9 @@
 -- Or remove existing autocmds by their group name (which is prefixed with `lazyvim_` for the defaults)
 -- e.g. vim.api.nvim_del_augroup_by_name("lazyvim_wrap_spell")
 
+-- 让打开的 buffer 跟上被外部进程改写的文件（formatter、构建、agent 等）。
+require("config.file_reload").setup()
+
 -- 工程启动后自动创建类似 VS Code 的布局：
 -- 左侧文件树、中央编辑区、下方终端。
 -- 本文件由 LazyVim 在 VeryLazy 阶段加载，因此直接 schedule 到本轮启动末尾。
