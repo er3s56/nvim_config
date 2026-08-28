@@ -37,5 +37,5 @@ vim.schedule(function()
     return
   end
 
-  require("config.git_panel").open_all_panels()
+  require("config.activity_bar").open_all_panels()
 end)

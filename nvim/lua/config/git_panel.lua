@@ -679,9 +679,6 @@ function M.reflow_layout()
     local usable_rows = math.max(vim.o.lines - 2, 4)
     local min_terminal = vim.o.lines >= 24 and 6 or 2
     local min_upper = vim.o.lines >= 24 and 8 or math.max(3, math.floor(usable_rows * 0.55))
-    local default_terminal_height = math.floor(usable_rows * 0.3)
-    default_terminal_height =
-      math.max(min_terminal, math.min(default_terminal_height, math.max(1, usable_rows - min_upper)))
 
     for _, terminal in ipairs(Snacks.terminal.list()) do
       if
@@ -691,12 +688,17 @@ function M.reflow_layout()
         and terminal.opts.relative == "editor"
         and #vim.api.nvim_tabpage_list_wins(vim.api.nvim_win_get_tabpage(terminal.win)) > 1
       then
-        local terminal_height =
-          math.max(min_terminal, math.min(default_terminal_height, math.max(1, usable_rows - min_upper)))
-        vim.wo[terminal.win].winfixheight = false
-        pcall(vim.api.nvim_win_set_height, terminal.win, terminal_height)
-        if vim.api.nvim_win_is_valid(terminal.win) then
-          vim.wo[terminal.win].winfixheight = true
+        -- Keep the height the terminal already has, so a reflow triggered by
+        -- an unrelated panel never resets a terminal the user resized. Only
+        -- pull it back inside the bounds that keep both windows usable.
+        local current = vim.api.nvim_win_get_height(terminal.win)
+        local terminal_height = math.max(min_terminal, math.min(current, math.max(1, usable_rows - min_upper)))
+        if terminal_height ~= current then
+          vim.wo[terminal.win].winfixheight = false
+          pcall(vim.api.nvim_win_set_height, terminal.win, terminal_height)
+          if vim.api.nvim_win_is_valid(terminal.win) then
+            vim.wo[terminal.win].winfixheight = true
+          end
         end
       end
     end
@@ -776,7 +778,12 @@ TerminalTabs.setup({
     return LazyVim.root()
   end,
   on_layout_change = function()
-    queue_layout_reflow(80)
+    local activity = package.loaded["config.activity_bar"]
+    if activity and activity.queue_reflow then
+      activity.queue_reflow(80)
+    else
+      queue_layout_reflow(80)
+    end
   end,
   on_layout_cancel = function()
     resize_generation = resize_generation + 1
@@ -843,6 +850,18 @@ activate_preview = function(state, preview, focus_preview)
       end
     else
       editor_context = capture_editor_context(main_win, current_buf)
+    end
+    -- Dashboard and similar transient buffers use bufhidden=wipe. Replacing
+    -- one with the Diff deletes it immediately, so retaining it as the editor
+    -- context would leave the preview buffer as the last buffer in the main
+    -- window. Deleting preview buffers during detach can then close the main
+    -- editor window altogether. Use a durable blank buffer for restoration.
+    if
+      editor_context
+      and vim.api.nvim_buf_is_valid(editor_context.buf)
+      and vim.bo[editor_context.buf].bufhidden == "wipe"
+    then
+      editor_context = nil
     end
     if not editor_context or not vim.api.nvim_buf_is_valid(editor_context.buf) then
       local fallback = vim.api.nvim_create_buf(true, false)
@@ -1227,7 +1246,12 @@ local function mouse_hits_panel_line(state, mouse)
   return position.row > 0 and mouse.screenrow == position.row
 end
 
-local function queue_terminal_insert(win)
+-- `focus = false` means "only finish a move the editor already made": the
+-- terminal has to still be the current window on the next tick. Rebuilding a
+-- panel layout moves windows around, and every such move fires WinEnter on the
+-- terminal; forcing focus from there stole the cursor out of the sidebar (and
+-- out of the editor at startup) after each Activity Bar action.
+local function queue_terminal_insert(win, opts)
   if not win or win < 1 or not vim.api.nvim_win_is_valid(win) then
     return
   end
@@ -1235,11 +1259,19 @@ local function queue_terminal_insert(win)
   if vim.bo[buf].buftype ~= "terminal" or vim.bo[buf].filetype ~= "snacks_terminal" then
     return
   end
+  local focus = not (opts and opts.focus == false)
   vim.schedule(function()
-    if vim.api.nvim_win_is_valid(win) and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_win_get_buf(win) == buf then
-      vim.api.nvim_set_current_win(win)
-      vim.cmd.startinsert()
+    if not vim.api.nvim_win_is_valid(win) or not vim.api.nvim_buf_is_valid(buf) then
+      return
     end
+    if vim.api.nvim_win_get_buf(win) ~= buf then
+      return
+    end
+    if not focus and vim.api.nvim_get_current_win() ~= win then
+      return
+    end
+    vim.api.nvim_set_current_win(win)
+    vim.cmd.startinsert()
   end)
 end
 
@@ -1409,6 +1441,10 @@ local function setup_global_mouse_mappings()
         end)
         return ""
       end
+      local activity = package.loaded["config.activity_bar"]
+      if activity and activity._handle_mouse and activity._handle_mouse(mouse) then
+        return ""
+      end
       queue_terminal_insert(mouse and mouse.winid)
       return key
     end, { expr = true, silent = true, desc = "Toggle or open Git panel item" })
@@ -1467,6 +1503,28 @@ function M.close()
   if vim.api.nvim_win_is_valid(state.win) then
     vim.api.nvim_win_close(state.win, true)
   end
+end
+
+-- Activity Bar owns the sidebar window lifecycle. Detach the Git model from
+-- that window without recording a standalone Git-panel placement, then leave
+-- a scratch buffer behind so the controller can replace the slot atomically.
+function M.detach(state)
+  state = state or current_state()
+  if not valid(state) then
+    return
+  end
+  close_preview(state)
+  local win, buf = state.win, state.buf
+  states[buf] = nil
+  if vim.api.nvim_win_is_valid(win) then
+    local scratch = vim.api.nvim_create_buf(false, true)
+    vim.bo[scratch].bufhidden = "wipe"
+    vim.api.nvim_win_set_buf(win, scratch)
+  end
+  if vim.api.nvim_buf_is_valid(buf) then
+    pcall(vim.api.nvim_buf_delete, buf, { force = true })
+  end
+  return win
 end
 
 function M.close_explorer()
@@ -1582,6 +1640,13 @@ function M.open_buffer(buf)
 
   local state = current_state()
   if not state then
+    local activity = package.loaded["config.activity_bar"]
+    local activity_win = activity and activity.editor_window and activity.editor_window() or nil
+    if activity_win and vim.api.nvim_win_is_valid(activity_win) then
+      vim.api.nvim_win_set_buf(activity_win, buf)
+      vim.api.nvim_set_current_win(activity_win)
+      return
+    end
     local explorer = Snacks.picker.get({ source = "explorer" })[1]
     local main_win = explorer and not explorer.closed and explorer.main or nil
     if main_win and vim.api.nvim_win_is_valid(main_win) then
@@ -1614,6 +1679,14 @@ end
 function M.cycle_buffer(direction)
   local state = current_state()
   if not state then
+    local activity = package.loaded["config.activity_bar"]
+    local activity_win = activity and activity.editor_window and activity.editor_window() or nil
+    if activity_win and vim.api.nvim_win_is_valid(activity_win) then
+      vim.api.nvim_win_call(activity_win, function()
+        vim.cmd(direction < 0 and "BufferLineCyclePrev" or "BufferLineCycleNext")
+      end)
+      return
+    end
     local explorer = Snacks.picker.get({ source = "explorer" })[1]
     local main_win = explorer and not explorer.closed and explorer.main or nil
     if main_win and vim.api.nvim_win_is_valid(main_win) then
@@ -1782,7 +1855,8 @@ function M.open_all_panels()
   end, 100)
 end
 
-function M.open(explorer, root, attempt)
+function M.open(explorer, root, attempt, open_opts)
+  open_opts = open_opts or {}
   disable_explorer_quit(explorer)
   local existing = current_state()
   if existing then
@@ -1790,18 +1864,22 @@ function M.open(explorer, root, attempt)
   end
 
   attempt = attempt or 0
-  if not explorer or explorer.closed then
+  local target_win = open_opts.target_win
+  if target_win and not vim.api.nvim_win_is_valid(target_win) then
     return
   end
-  if not explorer.layout or not explorer.layout.root or not explorer.layout.root:valid() then
+  if not target_win and (not explorer or explorer.closed) then
+    return
+  end
+  if not target_win and (not explorer.layout or not explorer.layout.root or not explorer.layout.root:valid()) then
     if attempt < 20 then
       vim.defer_fn(function()
-        M.open(explorer, root, attempt + 1)
+        M.open(explorer, root, attempt + 1, open_opts)
       end, 50)
     end
     return
   end
-  if not explorer_preferred_widths[explorer] then
+  if explorer and not explorer_preferred_widths[explorer] then
     explorer_preferred_widths[explorer] = vim.api.nvim_win_get_width(explorer.layout.root.win)
   end
 
@@ -1816,12 +1894,18 @@ function M.open(explorer, root, attempt)
   root = vim.fs.dirname(marker)
 
   local buf = vim.api.nvim_create_buf(false, true)
-  local height = default_git_height()
-  local win = vim.api.nvim_open_win(buf, false, {
-    split = "below",
-    win = explorer.layout.root.win,
-    height = height,
-  })
+  local win
+  if target_win then
+    win = target_win
+    vim.api.nvim_win_set_buf(win, buf)
+  else
+    local height = default_git_height()
+    win = vim.api.nvim_open_win(buf, false, {
+      split = "below",
+      win = explorer.layout.root.win,
+      height = height,
+    })
+  end
 
   vim.api.nvim_buf_set_name(buf, ("project-git://%d/%s"):format(vim.api.nvim_get_current_tabpage(), root))
   vim.bo[buf].buftype = "nofile"
@@ -1835,14 +1919,16 @@ function M.open(explorer, root, attempt)
   vim.wo[win].signcolumn = "no"
   vim.wo[win].statuscolumn = ""
   vim.wo[win].wrap = false
-  vim.wo[win].winfixheight = true
+  vim.wo[win].list = false
+  vim.wo[win].winfixheight = not target_win
+  vim.wo[win].winfixwidth = target_win ~= nil
 
   local state = {
     buf = buf,
     win = win,
     root = root,
     explorer = explorer,
-    editor_win = explorer.main,
+    editor_win = open_opts.editor_win or (explorer and explorer.main),
     branch = "Git",
     entries = {},
     collapsed = {
@@ -1896,6 +1982,14 @@ function M.open(explorer, root, attempt)
         end)
         return ""
       end
+      -- This buffer-local mapping shadows the global one, so it has to offer
+      -- the click to the Activity Bar itself. Without this, the first click on
+      -- an Activity Bar icon while the Git panel had focus only moved the
+      -- cursor there and a second click was needed to switch views.
+      local activity = package.loaded["config.activity_bar"]
+      if activity and activity._handle_mouse and activity._handle_mouse(mouse) then
+        return ""
+      end
       queue_terminal_insert(mouse.winid)
       return key
     end, {
@@ -1945,23 +2039,29 @@ function M.open(explorer, root, attempt)
       close_preview(state)
       states[buf] = nil
       vim.schedule(function()
-        if explorer.layout and explorer.layout:valid() then
+        if explorer and explorer.layout and explorer.layout:valid() then
           explorer.layout:update()
         end
       end)
     end,
   })
-  watch_explorer_root(state, explorer)
+  if explorer then
+    watch_explorer_root(state, explorer)
+  end
 
-  explorer.layout:update()
+  if explorer then
+    explorer.layout:update()
+  end
   queue_layout_reflow(80)
-  local key = placement_key(root, vim.api.nvim_win_get_tabpage(win))
-  local placement = git_panel_placements[key]
-  if placement then
-    local restored = PanelLayout.restore(placement.snapshot, { [placement.panel_win] = win })
-    git_panel_placements[key] = nil
-    if restored then
-      resize_generation = resize_generation + 1
+  if not target_win then
+    local key = placement_key(root, vim.api.nvim_win_get_tabpage(win))
+    local placement = git_panel_placements[key]
+    if placement then
+      local restored = PanelLayout.restore(placement.snapshot, { [placement.panel_win] = win })
+      git_panel_placements[key] = nil
+      if restored then
+        resize_generation = resize_generation + 1
+      end
     end
   end
   -- Splitting the Explorer layout while its initial async finder is still
@@ -1969,7 +2069,7 @@ function M.open(explorer, root, attempt)
   -- UI race after startup and perform one clean finder refresh only when it
   -- actually occurred.
   vim.defer_fn(function()
-    if not valid(state) or explorer.closed or not explorer.list or not explorer.list.items then
+    if not explorer or not valid(state) or explorer.closed or not explorer.list or not explorer.list.items then
       return
     end
     local seen = {}
@@ -1986,6 +2086,14 @@ function M.open(explorer, root, attempt)
   end, 200)
   M.refresh(buf)
   return state
+end
+
+function M.open_in_window(win, root, editor_win)
+  return M.open(nil, root, 0, { target_win = win, editor_win = editor_win })
+end
+
+function M.current()
+  return current_state()
 end
 
 function M.toggle()
@@ -2026,7 +2134,7 @@ vim.api.nvim_create_autocmd("WinEnter", {
     -- can switch the terminal back to Terminal-Normal ("nt") afterwards.
     -- Run once the window transition is complete so one click is enough to
     -- focus the project terminal and send subsequent keys to its job.
-    queue_terminal_insert(vim.api.nvim_get_current_win())
+    queue_terminal_insert(vim.api.nvim_get_current_win(), { focus = false })
   end,
 })
 vim.api.nvim_create_autocmd("VimResized", {

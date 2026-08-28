@@ -11,21 +11,75 @@ return {
     "folke/snacks.nvim",
     init = function()
       require("config.explorer_menu").setup()
-      local commands = {
-        PanelOpen = { "open_all_panels", "Restore all default project panels" },
-        PanelClose = { "close_current_panel", "Close the project panel under the cursor" },
-        GitPanelOpen = { "open_git_panel", "Open the project Git panel" },
-        GitPanelClose = { "close", "Close the project Git panel" },
-        ExplorerOpen = { "open_explorer", "Open the project Explorer panel" },
-        ExplorerClose = { "close_explorer", "Close the project Explorer panel" },
-        TerminalOpen = { "open_terminal", "Open the project terminal panel" },
-        TerminalClose = { "close_terminal", "Hide the project terminal panel" },
-      }
-      for name, command in pairs(commands) do
-        vim.api.nvim_create_user_command(name, function()
-          require("config.git_panel")[command[1]]()
-        end, { desc = command[2], force = true })
+      local ActivityBar = require("config.activity_bar")
+      ActivityBar.setup()
+
+      local function command(name, callback, opts)
+        opts = opts or {}
+        opts.force = true
+        vim.api.nvim_create_user_command(name, callback, opts)
       end
+
+      command("ActivityBarOpen", function(args)
+        ActivityBar.open(args.args ~= "" and args.args or nil)
+      end, {
+        nargs = "?",
+        complete = function()
+          return { "explorer", "search", "git" }
+        end,
+        desc = "Open an Activity Bar sidebar view",
+      })
+      command("ActivityBarToggle", function(args)
+        ActivityBar.toggle(args.args ~= "" and args.args or nil)
+      end, {
+        nargs = "?",
+        complete = function()
+          return { "explorer", "search", "git" }
+        end,
+        desc = "Toggle an Activity Bar sidebar view",
+      })
+      command("ActivityBarClose", function()
+        ActivityBar.close()
+      end, { desc = "Collapse the Activity Bar sidebar" })
+      command("SearchPanelOpen", function()
+        ActivityBar.open("search")
+      end, { desc = "Open the project Search sidebar" })
+      command("SearchPanelClose", function()
+        local state = ActivityBar.current()
+        if state and state.view == "search" then
+          ActivityBar.close()
+        end
+      end, { desc = "Close the project Search sidebar" })
+      command("ExplorerOpen", function()
+        ActivityBar.open("explorer")
+      end, { desc = "Open the project Explorer sidebar" })
+      command("ExplorerClose", function()
+        local state = ActivityBar.current()
+        if state and state.view == "explorer" then
+          ActivityBar.close()
+        end
+      end, { desc = "Close the project Explorer sidebar" })
+      command("GitPanelOpen", function()
+        ActivityBar.open("git")
+      end, { desc = "Open the project Git sidebar" })
+      command("GitPanelClose", function()
+        local state = ActivityBar.current()
+        if state and state.view == "git" then
+          ActivityBar.close()
+        end
+      end, { desc = "Close the project Git sidebar" })
+      command("PanelOpen", function()
+        ActivityBar.open_all_panels()
+      end, { desc = "Restore the Activity Bar, sidebar, and project terminal" })
+      command("PanelClose", function()
+        ActivityBar.close_current_panel()
+      end, { desc = "Close the project panel under the cursor" })
+      command("TerminalOpen", function()
+        require("config.git_panel").open_terminal()
+      end, { desc = "Open the project terminal panel" })
+      command("TerminalClose", function()
+        require("config.git_panel").close_terminal()
+      end, { desc = "Hide the project terminal panel" })
       vim.api.nvim_create_user_command("PanelBufferOpen", function(command)
         require("config.git_panel").open_buffer(command.args)
       end, {
@@ -85,7 +139,7 @@ return {
       {
         "<leader>gE",
         function()
-          require("config.git_panel").toggle()
+          require("config.activity_bar").toggle("git")
         end,
         desc = "显示/隐藏工程 Git 面板",
       },
@@ -129,6 +183,18 @@ return {
       -- Keep Bufferline's scheduled command path so real mouse clicks also
       -- trigger its normal UI refresh after the central editor is updated.
       opts.options.left_mouse_command = "PanelBufferOpen %d"
+      -- Neovim's tabline spans the whole screen. Reserve the Activity Bar and
+      -- the sidebar so buffer tabs begin above the central editor, the way an
+      -- editor tab strip is expected to sit. Bufferline sizes an offset from
+      -- the matched window, and only ever matches the first or last window of
+      -- the layout row, so the sidebar in between is covered by padding that
+      -- `config.activity_bar` keeps in sync with the real layout.
+      opts.options.offsets = opts.options.offsets or {}
+      table.insert(opts.options.offsets, 1, {
+        filetype = "activity_bar",
+        text = "",
+        highlight = "Normal",
+      })
     end,
   },
 }
