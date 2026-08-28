@@ -106,6 +106,9 @@ local function editor_candidate(state)
     return state.editor_win
   end
   local excluded = { [state.activity.win] = true }
+  if state.slot_hold then
+    excluded[state.slot_hold.win] = true
+  end
   local root = content_root(state.content)
   if root then
     excluded[root] = true
@@ -123,6 +126,127 @@ local function editor_candidate(state)
       return win
     end
   end
+end
+
+-- Snacks flushes the UI (`nvim__redraw` with flush) after every window it
+-- creates. Mid-mount that pushes half-built frames to the terminal -- the new
+-- sidebar briefly painted at the far left before it is moved into the slot.
+-- Suppress the flush (damage tracking stays) while a sidebar is being built;
+-- the natural end-of-tick redraw then shows only the finished layout.
+local flush_guard
+local function guard_flush()
+  if flush_guard or not vim.api.nvim__redraw then
+    return
+  end
+  local original = vim.api.nvim__redraw
+  flush_guard = original
+  vim.api.nvim__redraw = function(opts, ...)
+    if type(opts) == "table" and opts.flush then
+      opts = vim.tbl_extend("force", opts, { flush = false })
+    end
+    return original(opts, ...)
+  end
+end
+
+local function unguard_flush()
+  if flush_guard then
+    vim.api.nvim__redraw = flush_guard
+    flush_guard = nil
+  end
+end
+
+-- Switching views tears the old sidebar down asynchronously and mounts the
+-- new one several ticks later. In that gap the editor and the terminal expand
+-- into the vacated columns and are squeezed back afterwards -- measured as
+-- 3-4 width changes per switch, and every one of them delivers SIGWINCH to
+-- the terminal job, which then rewraps and garbles its output. Bridge the gap
+-- with a one-column placeholder inside the old sidebar and freeze every other
+-- window's width, so the vacated space can only flow placeholder <-> sidebar
+-- and the rest of the layout never moves.
+local function hold_slot(state, old_root)
+  if state.slot_hold or not valid_win(old_root) then
+    return
+  end
+  local frozen = {}
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(state.tab)) do
+    if vim.api.nvim_win_get_config(win).relative == "" and win ~= old_root then
+      frozen[win] = vim.wo[win].winfixwidth
+      vim.wo[win].winfixwidth = true
+    end
+  end
+  -- 'equalalways' re-balances every window on each split and close, which is
+  -- exactly the churn being prevented; keep it off for the whole handover.
+  local equalalways = vim.o.equalalways
+  vim.o.equalalways = false
+  -- The placeholder's columns must come out of the sidebar itself, not the
+  -- frozen remainder of the layout.
+  vim.wo[old_root].winfixwidth = false
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].bufhidden = "wipe"
+  local ok, placeholder = pcall(vim.api.nvim_open_win, buf, false, {
+    win = old_root,
+    split = "left",
+    width = 1,
+    style = "minimal",
+  })
+  if not ok or not valid_win(placeholder) then
+    vim.o.equalalways = equalalways
+    for win, fixed in pairs(frozen) do
+      if valid_win(win) then
+        vim.wo[win].winfixwidth = fixed
+      end
+    end
+    return
+  end
+  -- The only window whose width is not fixed: closing the old sidebar hands
+  -- its space to the placeholder, and the new sidebar takes it back from it.
+  vim.wo[placeholder].winfixwidth = false
+  state.slot_hold = { win = placeholder, frozen = frozen, equalalways = equalalways }
+end
+
+-- Closing the placeholder and lifting the width protection are separate
+-- steps: the layout restore that follows the close runs a series of
+-- win_splitmove calls, and with 'equalalways' back on each one re-balances
+-- the whole layout -- measured squeezing the terminal to 5 columns
+-- mid-restore. When such a state survives into the next tick (rapid
+-- switching), the pty really is resized that small, the shell redraws its
+-- prompt at 5 columns, and the terminal's content is destroyed for good.
+-- The freeze therefore has to outlive the entire mount.
+local function drop_slot_placeholder(state, absorber)
+  local hold = state.slot_hold
+  if not hold or not valid_win(hold.win) then
+    return
+  end
+  local absorber_fixed
+  if valid_win(absorber) and absorber ~= hold.win then
+    absorber_fixed = vim.wo[absorber].winfixwidth
+    vim.wo[absorber].winfixwidth = false
+  end
+  pcall(vim.api.nvim_win_close, hold.win, true)
+  if absorber_fixed ~= nil and valid_win(absorber) then
+    vim.wo[absorber].winfixwidth = absorber_fixed
+  end
+end
+
+local function thaw_slot(state)
+  local hold = state.slot_hold
+  if not hold then
+    return
+  end
+  state.slot_hold = nil
+  for win, fixed in pairs(hold.frozen) do
+    if valid_win(win) then
+      vim.wo[win].winfixwidth = fixed
+    end
+  end
+  if hold.equalalways ~= nil then
+    vim.o.equalalways = hold.equalalways
+  end
+end
+
+local function release_slot(state, absorber)
+  drop_slot_placeholder(state, absorber)
+  thaw_slot(state)
 end
 
 local function call_in_tab(tab, callback, anchor)
@@ -489,7 +613,25 @@ local function destroy_content(state)
     require("config.git_panel").detach(content.git_state)
     close_native(content)
   elseif content.picker and not content.picker.closed then
-    content.picker:close()
+    -- With a slot hold in place, take the old windows down synchronously
+    -- before the Picker's own (deferred, multi-tick) teardown runs. This is
+    -- what lets the whole swap -- close old, open new, arrange -- complete
+    -- inside a single tick: no frame ever shows the bare placeholder, so the
+    -- sidebar's border lines never visibly drop out and reappear.
+    if state.slot_hold then
+      local root = content_root(content)
+      if valid_win(root) then
+        pcall(vim.api.nvim_win_close, root, true)
+      end
+      for win in pairs(picker_windows(content.picker)) do
+        if valid_win(win) then
+          pcall(vim.api.nvim_win_close, win, true)
+        end
+      end
+    end
+    if not content.picker.closed then
+      content.picker:close()
+    end
   else
     close_native(content)
   end
@@ -746,11 +888,25 @@ local function restore_placement(state, root, width)
   local placement = state.placement
   state.placement = nil
   local restored = false
-  if placement and placement.snapshot then
+  if state.slot_hold then
+    -- A slot hold means the rest of the layout never moved: the placeholder
+    -- kept the sidebar's columns and every other width was frozen, so the
+    -- full snapshot rebuild has nothing to restore. Skipping it also skips
+    -- its win_splitmove storm and the winrestcmd pass, which addresses
+    -- windows by number and so resizes the wrong ones once the sidebar's
+    -- window ids have changed. (Measured: the rebuild squeezes the terminal
+    -- window through arbitrary widths intra-tick; that alone does not corrupt
+    -- the terminal -- its screen only resizes with a redraw -- but there is
+    -- no reason to leave the churn in.) Moving the new root behind the
+    -- Activity Bar and folding the placeholder into it is all that is needed.
+    arrange_activity(state, root)
+    drop_slot_placeholder(state, root)
+  elseif placement and placement.snapshot then
     restored = PanelLayout.restore(placement.snapshot, { [placement.win] = root }) == true
   end
-  -- Reassert both fixed widths after a snapshot restore. Neovim can transfer
-  -- the removed sidebar's width to Activity Bar while the Picker closes.
+  drop_slot_placeholder(state, root)
+  -- Reassert both fixed widths after the restore. Neovim can transfer the
+  -- removed sidebar's width to Activity Bar while the Picker closes.
   arrange_activity(state, root)
   local fixed = vim.wo[root].winfixwidth
   vim.wo[root].winfixwidth = false
@@ -782,15 +938,19 @@ local function finish_open(state, generation, width, focus)
   if state.generation ~= generation or not valid_tab(state.tab) or state.collapsed or state.responsive_hidden then
     return
   end
+  guard_flush()
   local opener = openers[state.view]
   local ok, content = pcall(opener, state, width, generation)
   if not ok then
+    unguard_flush()
+    release_slot(state, editor_candidate(state))
     vim.schedule(function()
       vim.notify("Activity Bar failed to open " .. state.view .. ": " .. tostring(content), vim.log.levels.ERROR)
     end)
     return
   end
   if state.generation ~= generation then
+    unguard_flush()
     if content then
       state.content = content
       destroy_content(state)
@@ -800,9 +960,12 @@ local function finish_open(state, generation, width, focus)
   state.content = content
   local function mount(attempt)
     if state.generation ~= generation or state.content ~= content then
+      unguard_flush()
       return
     end
     if not valid_tab(state.tab) then
+      unguard_flush()
+      release_slot(state)
       destroy_content(state)
       return
     end
@@ -812,10 +975,15 @@ local function finish_open(state, generation, width, focus)
         vim.defer_fn(function()
           mount(attempt + 1)
         end, 10)
+      else
+        unguard_flush()
+        release_slot(state, editor_candidate(state))
       end
       return
     end
     if tab_for_win(root) ~= state.tab then
+      unguard_flush()
+      release_slot(state, editor_candidate(state))
       destroy_content(state)
       return
     end
@@ -836,6 +1004,8 @@ local function finish_open(state, generation, width, focus)
     end
     normalize_mode()
     M.reflow(state.tab)
+    thaw_slot(state)
+    unguard_flush()
   end
   mount(0)
 end
@@ -848,7 +1018,15 @@ local function begin_open(state, focus)
     local closing = state.closing
     local closing_picker = closing.picker
     local closing_win = content_root(closing)
-    if (closing_picker and not closing_picker.closed) or valid_win(closing_win) then
+    -- Only the old windows must be gone before the slot can be refilled; the
+    -- Picker object's deferred data teardown is independent of the new
+    -- content and waiting for it would push the reopen into a later tick,
+    -- leaving a visible blank-sidebar frame.
+    local busy = valid_win(closing_win)
+    if not state.slot_hold then
+      busy = busy or (closing_picker and not closing_picker.closed)
+    end
+    if busy then
       local generation = state.generation
       vim.defer_fn(function()
         if state.generation == generation then
@@ -861,6 +1039,7 @@ local function begin_open(state, focus)
   end
   local width = available_width(state)
   if not width then
+    release_slot(state, editor_candidate(state))
     state.responsive_hidden = true
     render_activity(state)
     focus_editor(state)
@@ -876,10 +1055,18 @@ end
 local function replace_view(state, view, focus)
   state.generation = state.generation + 1
   local old_root = content_root(state.content)
+  -- A switch that lands while the previous one is still in flight (its
+  -- placeholder is holding the slot, state.content already gone) must inherit
+  -- that hold, not tear it down: releasing here would run the rest of this
+  -- transition unprotected, and its transient states -- which rapid clicking
+  -- lets survive across ticks -- resize the terminal's pty and destroy its
+  -- content. The bumped generation cancels the older transition's callbacks,
+  -- and this transition's mount releases the inherited hold.
   if state.content then
     save_content(state)
     if old_root then
       state.placement = { snapshot = PanelLayout.capture(old_root), win = old_root }
+      hold_slot(state, old_root)
     end
     destroy_content(state)
   end
@@ -914,6 +1101,7 @@ function M.close(opts)
   if not state or state.collapsed then
     return false
   end
+  release_slot(state, editor_candidate(state))
   state.generation = state.generation + 1
   local root = content_root(state.content)
   if state.content then
@@ -1125,6 +1313,7 @@ function M.reflow(tab)
     end
     local width = available_width(state)
     if not width and root and not state.collapsed then
+      release_slot(state, editor_candidate(state))
       save_content(state)
       state.generation = state.generation + 1
       state.placement = { snapshot = PanelLayout.capture(root), win = root }
