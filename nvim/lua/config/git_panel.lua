@@ -1855,6 +1855,112 @@ function M.open_all_panels()
   end, 100)
 end
 
+-- Coalesce refresh requests. A single `git commit` makes Git touch its dir
+-- several times, so debouncing keeps that down to one `git status`. Requests
+-- merge upwards: if anything in the window asked for the commit list too, the
+-- one refresh that runs reloads it.
+local function queue_refresh(buf, opts)
+  local state = states[buf]
+  if not valid(state) then
+    return
+  end
+  if opts and opts.full then
+    state.refresh_full = true
+  end
+  state.refresh_request = (state.refresh_request or 0) + 1
+  local request = state.refresh_request
+  vim.defer_fn(function()
+    if valid(state) and state.refresh_request == request then
+      local full = state.refresh_full
+      state.refresh_full = nil
+      M.refresh(buf, { status_only = not full })
+    end
+  end, 250)
+end
+
+local function refresh_all(opts)
+  for buf, state in pairs(states) do
+    if valid(state) then
+      queue_refresh(buf, opts)
+    end
+  end
+end
+
+-- Refresh every open Git panel. Used by callers outside this module, which
+-- must not reach into `states` themselves.
+function M.refresh_all(opts)
+  refresh_all(opts)
+end
+
+-- Watch the repository's Git directory.
+--
+-- Measured with a non-recursive fs_event on the Git dir: editing a tracked
+-- file, adding or removing an untracked one, and editing .gitignore produce no
+-- events at all -- the watcher only ever reports Git metadata. `git add`
+-- reports `index`, `git commit` reports `index` and `COMMIT_EDITMSG`, and
+-- `git checkout` reports `index` and `HEAD`. Working-tree changes therefore
+-- have to come from the autocmds further down; this covers the other half,
+-- Git commands run in the project terminal or in Lazygit.
+--
+-- `git status` is run with `--no-optional-locks`, which was confirmed not to
+-- write to the Git dir, so a refresh cannot trigger itself.
+local GIT_DIR_STATUS_ONLY = { index = true }
+
+local function stop_git_watcher(state)
+  local handle = state.git_watcher
+  state.git_watcher = nil
+  if handle and not handle:is_closing() then
+    handle:stop()
+    handle:close()
+  end
+end
+
+local function start_git_watcher(state)
+  local buf = state.buf
+  -- `rev-parse` resolves worktrees and submodules, where `.git` is a file
+  -- pointing elsewhere rather than the directory to watch.
+  run_git(state.root, { "rev-parse", "--absolute-git-dir" }, function(output, code)
+    if code ~= 0 or not valid(state) or state.git_watcher then
+      return
+    end
+    local gitdir = vim.trim(output or "")
+    if gitdir == "" or vim.fn.isdirectory(gitdir) ~= 1 then
+      return
+    end
+    local handle = vim.uv.new_fs_event()
+    if not handle then
+      return
+    end
+    local started = handle:start(gitdir, {}, function(err, filename)
+      if err then
+        return
+      end
+      -- Git writes `<ref>.lock` and renames it into place. Acting on the lock
+      -- would read a half-written ref.
+      if filename and (filename:match("%.lock$") or filename:match("^%.watchman%-cookie")) then
+        return
+      end
+      -- Only the cheap path is an allow-list: misreading an unknown entry as
+      -- expensive costs one `git log`, while the reverse leaves the commit
+      -- list stale.
+      local full = not (filename and GIT_DIR_STATUS_ONLY[filename])
+      vim.schedule(function()
+        queue_refresh(buf, { full = full })
+      end)
+    end)
+    if not started then
+      handle:close()
+      return
+    end
+    if not valid(state) then
+      handle:stop()
+      handle:close()
+      return
+    end
+    state.git_watcher = handle
+  end)
+end
+
 function M.open(explorer, root, attempt, open_opts)
   open_opts = open_opts or {}
   disable_explorer_quit(explorer)
@@ -1944,6 +2050,7 @@ function M.open(explorer, root, attempt, open_opts)
     preview_generation = 0,
   }
   states[buf] = state
+  start_git_watcher(state)
   setup_context_menu()
   setup_global_mouse_mappings()
 
@@ -2037,6 +2144,7 @@ function M.open(explorer, root, attempt, open_opts)
     buffer = buf,
     callback = function()
       close_preview(state)
+      stop_git_watcher(state)
       states[buf] = nil
       vim.schedule(function()
         if explorer and explorer.layout and explorer.layout:valid() then
@@ -2111,20 +2219,6 @@ function M.toggle()
   end
 end
 
-local function queue_refresh(buf)
-  local state = states[buf]
-  if not valid(state) then
-    return
-  end
-  state.refresh_request = (state.refresh_request or 0) + 1
-  local request = state.refresh_request
-  vim.defer_fn(function()
-    if valid(state) and state.refresh_request == request then
-      M.refresh(buf, { status_only = true })
-    end
-  end, 250)
-end
-
 local group = vim.api.nvim_create_augroup("project_git_panel_refresh", { clear = true })
 vim.api.nvim_create_autocmd("WinEnter", {
   group = group,
@@ -2143,24 +2237,39 @@ vim.api.nvim_create_autocmd("VimResized", {
     queue_layout_reflow(80)
   end,
 })
-vim.api.nvim_create_autocmd("BufWritePost", {
+-- Working-tree changes never reach the Git dir watcher, so they have to be
+-- picked up from editor events instead. FocusGained covers files changed by
+-- anything outside Neovim; the terminal events cover commands run in the
+-- project terminal, and TermClose doubles as the fallback for Lazygit, which
+-- can move HEAD before it exits.
+vim.api.nvim_create_autocmd({ "BufWritePost", "FocusGained", "TermLeave" }, {
   group = group,
   callback = function()
-    for buf, state in pairs(states) do
-      if valid(state) then
-        queue_refresh(buf)
-      end
-    end
+    refresh_all()
   end,
 })
+vim.api.nvim_create_autocmd({ "TermClose", "DirChanged" }, {
+  group = group,
+  callback = function()
+    refresh_all({ full = true })
+  end,
+})
+-- GitSignsUpdate only fires for buffers Gitsigns has attached to, so it covers
+-- open files alone; GitSignsChanged accompanies its own staging actions.
 vim.api.nvim_create_autocmd("User", {
   group = group,
-  pattern = "GitSignsUpdate",
+  pattern = { "GitSignsUpdate", "GitSignsChanged" },
   callback = function()
-    for buf, state in pairs(states) do
-      if valid(state) then
-        queue_refresh(buf)
-      end
+    refresh_all()
+  end,
+})
+-- Last line of defence: whatever was missed, looking at the panel refreshes it.
+vim.api.nvim_create_autocmd({ "BufEnter", "WinEnter" }, {
+  group = group,
+  callback = function()
+    local buf = vim.api.nvim_get_current_buf()
+    if states[buf] then
+      queue_refresh(buf)
     end
   end,
 })

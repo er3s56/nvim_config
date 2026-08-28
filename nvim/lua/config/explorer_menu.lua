@@ -138,6 +138,10 @@ local function refresh(picker, target, dirs)
     Tree:open(vim.fn.isdirectory(target) == 1 and target or vim.fs.dirname(target))
   end
   require("snacks.explorer.actions").update(picker, { target = target, refresh = true })
+  -- Creating, renaming and deleting files changes what Git reports, but none
+  -- of it writes a buffer, touches the Git directory, or takes focus out of
+  -- Neovim, so no other refresh trigger sees it.
+  require("config.git_panel").refresh_all()
 end
 
 local function confirm(prompt, callback)
