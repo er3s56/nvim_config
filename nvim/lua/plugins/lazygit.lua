@@ -11,6 +11,7 @@ return {
     "folke/snacks.nvim",
     init = function()
       require("config.explorer_menu").setup()
+      require("config.picker_finder").setup()
       local ActivityBar = require("config.activity_bar")
       ActivityBar.setup()
 
