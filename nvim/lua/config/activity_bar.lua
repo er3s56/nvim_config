@@ -60,6 +60,39 @@ local function pin_buffer(win)
   end
 end
 
+-- Text-selection gestures do not belong in a panel: dragging starts a Visual
+-- selection over a file tree or an icon strip and strands the panel in Visual
+-- mode, and multi-clicks select a word or a line. Neutralise all of them per
+-- panel buffer. Buffer-local is safe here because each of these gestures
+-- follows a press that already focused the window, so the panel's buffer is
+-- current by the time they arrive.
+local SELECTION_GESTURES = {
+  "<LeftDrag>",
+  "<LeftRelease>",
+  "<2-LeftMouse>",
+  "<3-LeftMouse>",
+  "<4-LeftMouse>",
+  "<2-LeftDrag>",
+  "<3-LeftDrag>",
+  "<4-LeftDrag>",
+  "<2-LeftRelease>",
+  "<3-LeftRelease>",
+  "<4-LeftRelease>",
+}
+
+local function disable_selection_gestures(buf)
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+  for _, key in ipairs(SELECTION_GESTURES) do
+    vim.keymap.set({ "n", "i", "x" }, key, "<Nop>", {
+      buffer = buf,
+      silent = true,
+      desc = "No text selection inside project panels",
+    })
+  end
+end
+
 local function normalize_view(view)
   view = type(view) == "string" and view:lower() or view
   return view_index[view] and view or nil
@@ -370,6 +403,7 @@ local function configure_activity_buffer(state)
   vim.keymap.set("n", "<Up>", "k", { buffer = buf, remap = true, silent = true })
   vim.keymap.set("n", "q", "<Nop>", { buffer = buf, silent = true, desc = "Disabled in project panels" })
   vim.keymap.set("n", "<Esc>", "<Nop>", { buffer = buf, silent = true, desc = "Disabled in project panels" })
+  disable_selection_gestures(buf)
   render_activity(state)
 end
 
@@ -511,6 +545,7 @@ local function refine_picker_mouse(picker)
     return
   end
   for _, window in pairs({ picker.input and picker.input.win, picker.list and picker.list.win }) do
+    disable_selection_gestures(window and window.buf)
   end
 end
 
@@ -754,6 +789,7 @@ local function create_plain_sidebar(state, width, filetype, lines)
   vim.wo[win].wrap = true
   vim.wo[win].winfixwidth = true
   vim.wo[win].list = false
+  disable_selection_gestures(buf)
   return { win = win, buf = buf }
 end
 
@@ -1185,6 +1221,30 @@ end
 -- This has to live in the global mouse chain rather than a buffer-local
 -- mapping: buffer-local mappings apply to the *current* buffer, so the first
 -- click on an unfocused sidebar would only move focus and be swallowed.
+-- True when the mouse is over one of this project's panels. Used to reject
+-- text-selection gestures globally: buffer-local mappings only apply once the
+-- panel already has focus, so a gesture started from the editor would still
+-- reach the default handler on its first use.
+function M._over_panel(mouse)
+  local win = mouse and tonumber(mouse.winid)
+  if not win or win < 1 or not valid_win(win) then
+    return false
+  end
+  local state = state_for(tab_for_win(win), false)
+  if not state then
+    return false
+  end
+  if win == state.activity.win or win == content_root(state.content) then
+    return true
+  end
+  if picker_windows(state.content and state.content.picker)[win] then
+    return true
+  end
+  local buf = vim.api.nvim_win_get_buf(win)
+  local filetype = vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].filetype or ""
+  return filetype == "project_git_panel" or filetype == "activity_git_slot" or filetype == "activity_search_error"
+end
+
 function M._handle_list_click(mouse)
   local state = state_for(tab_for_win(mouse and mouse.winid), false)
   local picker = state and state.content and state.content.picker or nil
@@ -1501,6 +1561,38 @@ function M.setup()
     silent = true,
     desc = "Activate Activity Bar item",
   })
+
+  -- Multi-click gestures select a word or a line. Inside a panel that is
+  -- meaningless and strands it in Visual mode, so swallow them there. This
+  -- has to be global for the same reason the single click is: the panel's
+  -- buffer is not current until the press has been processed.
+  for _, key in ipairs({
+    "<2-LeftMouse>",
+    "<3-LeftMouse>",
+    "<4-LeftMouse>",
+    "<2-LeftDrag>",
+    "<3-LeftDrag>",
+    "<4-LeftDrag>",
+    "<2-LeftRelease>",
+    "<3-LeftRelease>",
+    "<4-LeftRelease>",
+  }) do
+    local lhs = key
+    vim.keymap.set({ "n", "x", "i", "t" }, lhs, function()
+      local mouse = vim.fn.getmousepos()
+      if M._over_panel(mouse) then
+        return ""
+      end
+      -- The project terminal is not an Activity Bar panel, but selecting its
+      -- rendered output is just as meaningless and drops it out of Terminal
+      -- mode.
+      local scrollbar = package.loaded["config.picker_scrollbar"]
+      if scrollbar and scrollbar._over_terminal and scrollbar._over_terminal(mouse) then
+        return ""
+      end
+      return lhs
+    end, { expr = true, silent = true, desc = "No text selection inside project panels" })
+  end
 
   local group = vim.api.nvim_create_augroup("project_activity_bar", { clear = true })
   vim.api.nvim_create_autocmd("VimResized", {

@@ -267,6 +267,21 @@ local ok, test_error = pcall(function()
     "a single click on a folder did not toggle it"
   )
 
+  -- Dragging in a panel used to start a Visual selection over the file tree.
+  for _, window in ipairs({ state.content.picker.list.win, state.content.picker.input.win }) do
+    local buf = window.buf
+    for _, key in ipairs({ "<LeftDrag>", "<LeftRelease>" }) do
+      local found
+      for _, map in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+        if map.lhs == key then
+          found = map
+        end
+      end
+      assert(found, ("%s is not neutralised in the panel"):format(key))
+      assert((found.rhs or "") == "", ("%s does something other than nothing"):format(key))
+    end
+  end
+
   -- Losing the Activity Bar column must take its sidebar down with it.
   local tab = state.tab
   vim.api.nvim_win_close(state.activity.win, true)

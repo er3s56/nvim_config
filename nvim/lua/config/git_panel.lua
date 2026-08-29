@@ -1452,6 +1452,16 @@ local function setup_global_mouse_mappings()
       if activity and activity._handle_list_click and activity._handle_list_click(mouse) then
         return ""
       end
+      -- Multi-clicks select a word or a line; inside a panel or over the
+      -- terminal that is meaningless and strands them in Visual mode.
+      if key ~= "<LeftMouse>" then
+        if activity and activity._over_panel and activity._over_panel(mouse) then
+          return ""
+        end
+        if scrollbar and scrollbar._over_terminal and scrollbar._over_terminal(mouse) then
+          return ""
+        end
+      end
       queue_terminal_insert(mouse and mouse.winid)
       return key
     end, { expr = true, silent = true, desc = "Toggle or open Git panel item" })
@@ -2043,6 +2053,26 @@ function M.open(explorer, root, attempt, open_opts)
   vim.wo[win].list = false
   vim.wo[win].winfixheight = not target_win
   vim.wo[win].winfixwidth = target_win ~= nil
+  -- Text-selection gestures do not belong in the panel: they select words and
+  -- lines of the rendered tree and strand it in Visual mode. The panel's own
+  -- multi-click mappings below replace the ones that carry an action.
+  for _, key in ipairs({
+    "<LeftDrag>",
+    "<LeftRelease>",
+    "<2-LeftDrag>",
+    "<3-LeftDrag>",
+    "<4-LeftDrag>",
+    "<2-LeftRelease>",
+    "<3-LeftRelease>",
+    "<4-LeftRelease>",
+  }) do
+    vim.keymap.set({ "n", "i", "x" }, key, "<Nop>", {
+      buffer = buf,
+      silent = true,
+      desc = "No text selection inside project panels",
+    })
+  end
+
   local state = {
     buf = buf,
     win = win,
@@ -2109,6 +2139,9 @@ function M.open(explorer, root, attempt, open_opts)
       -- cursor there and a second click was needed to switch views.
       local activity = package.loaded["config.activity_bar"]
       if activity and activity._handle_mouse and activity._handle_mouse(mouse) then
+        return ""
+      end
+      if key ~= "<LeftMouse>" then
         return ""
       end
       queue_terminal_insert(mouse.winid)
