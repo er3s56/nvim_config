@@ -5,8 +5,13 @@
 -- without disturbing the child. Only timing-robust invariants are asserted:
 -- no frame count or duration checks.
 local root = vim.fn.tempname()
-vim.fn.mkdir(root .. "/src", "p")
+vim.fn.mkdir(root .. "/src/many", "p")
 assert(vim.fn.writefile({ "local x = 1" }, root .. "/src/a.lua") == 0)
+-- Enough entries that the Explorer list overflows its window and earns a
+-- scrollbar.
+for index = 1, 60 do
+  assert(vim.fn.writefile({ "x" }, ("%s/src/many/f%03d.txt"):format(root, index)) == 0)
+end
 assert(vim.fn.writefile({ "# readme" }, root .. "/README.md") == 0)
 local function git(args)
   local command = { "git", "-C", root }
@@ -138,6 +143,25 @@ local ok, test_error = pcall(function()
     ("switching corrupted the terminal content (was %q, now %q)"):format(prompt, prompt_after)
   )
 
+  -- Snacks picker lists are virtualized (the buffer only ever holds the
+  -- visible rows), so a buffer-derived scrollbar there would be permanently
+  -- full-height noise popping in and out on switches; it is excluded. Even
+  -- with the directory expanded well past the window height, no scrollview
+  -- float may sit beside the Explorer list.
+  child([[
+    require("config.activity_bar").open("explorer", { focus = false })
+    return 0
+  ]])
+  watch(1500)
+  child([[
+    local picker = Snacks.picker.get({ source = "explorer" })[1]
+    if picker then
+      require("snacks.explorer.tree"):open(vim.fn.getcwd() .. "/src/many")
+      picker:find()
+    end
+    return 0
+  ]])
+  watch(2500)
   local stray_bars = child([[
     local out = {}
     for _, w in ipairs(vim.api.nvim_list_wins()) do
@@ -145,7 +169,7 @@ local ok, test_error = pcall(function()
       if cfg_ok and cfg.relative ~= "" then
         local b = vim.api.nvim_win_get_buf(w)
         if vim.bo[b].filetype == "scrollview" and (tonumber(cfg.col) or 999) < 100 then
-          out[#out + 1] = ("col=%s"):format(tostring(cfg.col))
+          out[#out + 1] = "col=" .. tostring(cfg.col)
         end
       end
     end
@@ -153,9 +177,7 @@ local ok, test_error = pcall(function()
   ]])
   assert(
     stray_bars == "",
-    ("a scrollview bar is back inside the sidebar region (%s); its deferred refresh flickers on every switch"):format(
-      stray_bars
-    )
+    ("a full-height noise scrollbar is back on the virtualized Explorer list (%s)"):format(stray_bars)
   )
 end)
 

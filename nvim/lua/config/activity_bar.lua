@@ -1116,6 +1116,10 @@ function M.close(opts)
   render_activity(state)
   focus_editor(state)
   normalize_mode()
+  local scrollview = package.loaded["scrollview"]
+  if scrollview and scrollview.refresh_impl_async then
+    pcall(scrollview.refresh_impl_async)
+  end
   return true
 end
 
@@ -1354,6 +1358,12 @@ function M.reflow(tab)
   end
   pcall(require("config.git_panel").reflow_layout)
   sync_tabline_offset()
+  -- Scrollbars follow the sidebar swap in the next tick or two rather than
+  -- trailing it by scrollview's own deferred autocmd schedule.
+  local scrollview = package.loaded["scrollview"]
+  if scrollview and scrollview.refresh_impl_async then
+    pcall(scrollview.refresh_impl_async)
+  end
 end
 
 function M.queue_reflow(delay, tab)
