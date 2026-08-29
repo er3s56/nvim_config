@@ -12,6 +12,7 @@ return {
     init = function()
       require("config.explorer_menu").setup()
       require("config.picker_finder").setup()
+      require("config.picker_scrollbar").setup()
       local ActivityBar = require("config.activity_bar")
       ActivityBar.setup()
 

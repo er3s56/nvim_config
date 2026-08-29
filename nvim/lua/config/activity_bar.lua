@@ -1442,6 +1442,10 @@ function M.setup()
     if M._handle_mouse(mouse) then
       return ""
     end
+    local scrollbar = package.loaded["config.picker_scrollbar"]
+    if scrollbar and scrollbar.handle_mouse and scrollbar.handle_mouse(mouse) then
+      return ""
+    end
     M._queue_terminal_insert(mouse)
     return "<LeftMouse>"
   end, {

@@ -1445,6 +1445,10 @@ local function setup_global_mouse_mappings()
       if activity and activity._handle_mouse and activity._handle_mouse(mouse) then
         return ""
       end
+      local scrollbar = package.loaded["config.picker_scrollbar"]
+      if scrollbar and scrollbar.handle_mouse and scrollbar.handle_mouse(mouse) then
+        return ""
+      end
       queue_terminal_insert(mouse and mouse.winid)
       return key
     end, { expr = true, silent = true, desc = "Toggle or open Git panel item" })
@@ -1457,9 +1461,17 @@ local function setup_global_mouse_mappings()
       end)
       return ""
     end
+    local scrollbar = package.loaded["config.picker_scrollbar"]
+    if scrollbar and scrollbar.handle_drag and scrollbar.handle_drag(mouse) then
+      return ""
+    end
     return "<LeftDrag>"
   end, { expr = true, silent = true, desc = "Position Git panel cursor" })
   vim.keymap.set({ "n", "x", "i" }, "<LeftRelease>", function()
+    local scrollbar = package.loaded["config.picker_scrollbar"]
+    if scrollbar and scrollbar.handle_release and scrollbar.handle_release() then
+      return ""
+    end
     return mouse_panel_target() and "" or "<LeftRelease>"
   end, { expr = true, silent = true, desc = "Finish Git panel click" })
 
