@@ -4,12 +4,22 @@ local TerminalTabs = require("config.terminal_tabs")
 
 local M = {}
 
+-- The commit list grows as it is scrolled rather than loading the whole
+-- history: `git log` over a large repository is measured at 11s and 110MB of
+-- output for a million commits, which would also mean a million-line buffer.
+local COMMIT_BATCH = 200
 local states = {}
+local load_commits
 local ns = vim.api.nvim_create_namespace("project_git_panel")
 local resize_generation = 0
 local reflowing_layout = false
 local explorer_preferred_widths = setmetatable({}, { __mode = "k" })
 local git_panel_placements = {}
+-- How much history each repository had expanded, kept across panel instances.
+-- Activity Bar destroys and rebuilds the panel on every view switch, so
+-- without this a list the user grew with Load More would snap back to the
+-- first batch as soon as they looked at the Explorer and came back.
+local commit_depths = {}
 
 local function placement_key(root, tab)
   return root .. "\0" .. tostring(tab)
@@ -162,17 +172,57 @@ local function render(state)
         end
       end
     end
+    -- The history is loaded a batch at a time and stops there. Reaching the
+    -- end of the list is a deliberate pause with an explicit entry, rather
+    -- than history that keeps growing under the scroll.
+    if not state.commits_exhausted and #state.commits > 0 then
+      if state.commit_loading then
+        add("    Loading more commits…", "Comment", { kind = "commit_load_more", loading = true })
+      else
+        add("  ↓ Load more commits", "Function", { kind = "commit_load_more" })
+      end
+    end
   end
 
   state.entries = entries
-  vim.bo[state.buf].modifiable = true
-  vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
-  vim.api.nvim_buf_clear_namespace(state.buf, ns, 0, -1)
-  for _, item in ipairs(highlights) do
-    vim.api.nvim_buf_add_highlight(state.buf, ns, item[2], item[1], 0, -1)
+  -- Appending a batch leaves every earlier line untouched, so replace only the
+  -- tail that actually changed. Rewriting the whole buffer costs seconds once
+  -- the list is thousands of lines long, and it scrolls the viewport away from
+  -- where the reader left it.
+  local previous = state.rendered_lines or {}
+  local shared = 0
+  while shared < #lines and shared < #previous and lines[shared + 1] == previous[shared + 1] do
+    shared = shared + 1
   end
+  local view
+  if vim.api.nvim_win_is_valid(state.win) then
+    view = vim.api.nvim_win_call(state.win, vim.fn.winsaveview)
+  end
+  vim.bo[state.buf].modifiable = true
+  if shared > 0 and shared == #previous and #lines > #previous then
+    -- Pure append: only the new tail is written.
+    vim.api.nvim_buf_set_lines(state.buf, shared, -1, false, vim.list_slice(lines, shared + 1))
+  else
+    vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
+    vim.api.nvim_buf_clear_namespace(state.buf, ns, 0, -1)
+    shared = 0
+  end
+  for index, item in ipairs(highlights) do
+    if item[1] >= shared then
+      vim.api.nvim_buf_add_highlight(state.buf, ns, item[2], item[1], 0, -1)
+    end
+    local _ = index
+  end
+  state.rendered_lines = lines
   vim.bo[state.buf].modifiable = false
   pcall(vim.api.nvim_win_set_cursor, state.win, { math.min(cursor[1], #lines), 0 })
+  if view then
+    pcall(vim.api.nvim_win_call, state.win, function()
+      view.lnum = math.min(view.lnum, #lines)
+      view.topline = math.min(view.topline, #lines)
+      vim.fn.winrestview(view)
+    end)
+  end
 end
 
 local function parse_status(output)
@@ -205,6 +255,70 @@ local function parse_status(output)
   return branch, changes
 end
 
+-- Append the next slice of history, or reload the first `count` commits when
+-- `reset` is set. Guarded by the same generation counter as a full refresh, so
+-- a slice that arrives after the panel moved on is discarded.
+function load_commits(state, opts)
+  opts = opts or {}
+  if not valid(state) or state.commit_loading then
+    return
+  end
+  if not opts.reset and state.commits_exhausted then
+    return
+  end
+  local skip = opts.reset and 0 or state.commit_offset
+  local count = opts.count or COMMIT_BATCH
+  -- Ask for one commit beyond what is wanted. A full request is otherwise
+  -- ambiguous -- it can mean "there is more" or "that was the whole history"
+  -- -- and guessing either way is wrong: guessing "more" leaves a Load More
+  -- entry that does nothing, guessing "done" hides commits that arrive later.
+  local probe = count + 1
+  state.commit_loading = true
+  state.commit_generation = state.commit_generation + 1
+  local commit_generation = state.commit_generation
+  run_git(state.root, {
+    "log",
+    "--pretty=format:%H%x09%h%x09%s",
+    ("--skip=%d"):format(skip),
+    ("-n%d"):format(probe),
+  }, function(output)
+    if not valid(state) or state.commit_generation ~= commit_generation then
+      state.commit_loading = false
+      return
+    end
+    local batch = {}
+    for line in output:gmatch("[^\r\n]+") do
+      local full_hash, hash, subject = line:match("^([^\t]+)\t([^\t]+)\t(.*)$")
+      if full_hash and hash and subject then
+        batch[#batch + 1] = {
+          kind = "commit",
+          full_hash = full_hash,
+          hash = hash,
+          subject = subject,
+        }
+      end
+    end
+    -- The extra commit is only a probe; it never enters the list.
+    local exhausted = #batch <= count
+    batch[count + 1] = nil
+    if opts.reset then
+      state.commits = {}
+    end
+    state.commits = state.commits or {}
+    for _, commit in ipairs(batch) do
+      state.commits[#state.commits + 1] = commit
+    end
+    state.commit_offset = #state.commits
+    state.commits_exhausted = exhausted
+    commit_depths[state.root] = {
+      offset = state.commit_offset,
+      exhausted = state.commits_exhausted,
+    }
+    state.commit_loading = false
+    render(state)
+  end)
+end
+
 function M.refresh(buf, opts)
   local state = states[buf]
   if not valid(state) then
@@ -217,6 +331,7 @@ function M.refresh(buf, opts)
   if not opts.status_only then
     state.changes = nil
     state.commits = nil
+    state.commits_exhausted = false
     render(state)
   end
 
@@ -240,29 +355,12 @@ function M.refresh(buf, opts)
     return
   end
 
-  state.commit_generation = state.commit_generation + 1
-  local commit_generation = state.commit_generation
-  run_git(state.root, {
-    "log",
-    "--pretty=format:%H%x09%h%x09%s",
-  }, function(output)
-    if not valid(state) or state.commit_generation ~= commit_generation then
-      return
-    end
-    state.commits = {}
-    for line in output:gmatch("[^\r\n]+") do
-      local full_hash, hash, subject = line:match("^([^\t]+)\t([^\t]+)\t(.*)$")
-      if full_hash and hash and subject then
-        state.commits[#state.commits + 1] = {
-          kind = "commit",
-          full_hash = full_hash,
-          hash = hash,
-          subject = subject,
-        }
-      end
-    end
-    render(state)
-  end)
+  -- Reload as many commits as were already on screen, so a refresh triggered
+  -- by a commit or a checkout does not yank the list back to the first batch
+  -- while it is being scrolled.
+  local remembered = commit_depths[state.root]
+  local depth = math.max(COMMIT_BATCH, state.commit_offset, remembered and remembered.offset or 0)
+  load_commits(state, { count = depth, reset = true })
 end
 
 local function current_state()
@@ -1210,6 +1308,10 @@ local function action(state, focus_preview)
   if entry.kind == "section" then
     state.collapsed[entry.section] = not state.collapsed[entry.section]
     render(state)
+  elseif entry.kind == "commit_load_more" then
+    if not entry.loading then
+      load_commits(state)
+    end
   elseif entry.kind == "commit" then
     if state.expanded[entry.full_hash] then
       state.expanded[entry.full_hash] = nil
@@ -2091,6 +2193,9 @@ function M.open(explorer, root, attempt, open_opts)
     preview_serial = 0,
     status_generation = 0,
     commit_generation = 0,
+    commit_offset = 0,
+    commits_exhausted = false,
+    commit_loading = false,
     preview_generation = 0,
   }
   states[buf] = state
@@ -2295,6 +2400,10 @@ vim.api.nvim_create_autocmd({ "BufWritePost", "FocusGained", "TermLeave" }, {
     refresh_all()
   end,
 })
+-- Grow the commit list as it is scrolled: once the viewport comes within a
+-- margin of the last line, append the next batch. The panel is a real buffer,
+-- so the viewport's own last line is an honest measure of how far down the
+-- reader is.
 vim.api.nvim_create_autocmd({ "TermClose", "DirChanged" }, {
   group = group,
   callback = function()
