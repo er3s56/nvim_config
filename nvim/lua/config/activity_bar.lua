@@ -506,6 +506,14 @@ local function disable_search_ignored(picker)
   end
 end
 
+local function refine_picker_mouse(picker)
+  if not picker then
+    return
+  end
+  for _, window in pairs({ picker.input and picker.input.win, picker.list and picker.list.win }) do
+  end
+end
+
 local function keep_search_preview(state, picker)
   for _, window in pairs({ picker.input and picker.input.win, picker.list and picker.list.win }) do
     local buf = window and window.buf
@@ -768,6 +776,7 @@ local function open_explorer(state, width, generation)
   stabilize_picker_close(picker)
   picker:show()
   disable_picker_quit(picker)
+  refine_picker_mouse(picker)
   picker.main = editor
   restore_list_position(state, picker, state.explorer, generation, true)
   return { kind = "explorer", picker = picker }
@@ -815,6 +824,7 @@ local function open_search(state, width, generation)
   stabilize_picker_close(picker)
   picker:show()
   disable_picker_quit(picker)
+  refine_picker_mouse(picker)
   disable_search_ignored(picker)
   picker.main = editor
   set_search_winbar(state, picker)
@@ -990,6 +1000,7 @@ local function finish_open(state, generation, width, focus)
     restore_placement(state, root, width)
     if content.picker then
       disable_picker_quit(content.picker)
+      refine_picker_mouse(content.picker)
     end
     if content.kind == "search" and content.picker then
       disable_search_ignored(content.picker)
@@ -1166,6 +1177,39 @@ function M.toggle_search_hidden(tab)
   picker:action("toggle_hidden")
   state.search.hidden = picker.opts.hidden == true
   set_search_winbar(state, picker)
+end
+
+-- Snacks binds only <2-LeftMouse> on a picker list, so a folder in the
+-- Explorer needs a double click to expand. Its `confirm` action already does
+-- the right thing for a single click -- toggle a directory, open a file.
+-- This has to live in the global mouse chain rather than a buffer-local
+-- mapping: buffer-local mappings apply to the *current* buffer, so the first
+-- click on an unfocused sidebar would only move focus and be swallowed.
+function M._handle_list_click(mouse)
+  local state = state_for(tab_for_win(mouse and mouse.winid), false)
+  local picker = state and state.content and state.content.picker or nil
+  local list = picker and not picker.closed and picker.list or nil
+  if not list or not list.win or not list.win:valid() or mouse.winid ~= list.win.win then
+    return false
+  end
+  local row = mouse.line
+  if not row or row < 1 or row > list:count() then
+    return false
+  end
+  -- getmousepos() reports the last line for a click below the final entry.
+  local position = vim.fn.screenpos(list.win.win, row, 1)
+  if position.row == 0 or mouse.screenrow ~= position.row then
+    return false
+  end
+  vim.schedule(function()
+    if picker.closed or not list.win:valid() then
+      return
+    end
+    vim.api.nvim_set_current_win(list.win.win)
+    list:move(row, true, true)
+    picker:action("confirm")
+  end)
+  return true
 end
 
 function M._handle_mouse(mouse)
@@ -1444,6 +1488,9 @@ function M.setup()
     end
     local scrollbar = package.loaded["config.picker_scrollbar"]
     if scrollbar and scrollbar.handle_mouse and scrollbar.handle_mouse(mouse) then
+      return ""
+    end
+    if M._handle_list_click(mouse) then
       return ""
     end
     M._queue_terminal_insert(mouse)

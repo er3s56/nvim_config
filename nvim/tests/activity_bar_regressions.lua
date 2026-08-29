@@ -226,6 +226,47 @@ local ok, test_error = pcall(function()
   )
   state = assert(ActivityBar.current())
 
+  -- Snacks binds only <2-LeftMouse> on a picker list, so a single click on a
+  -- folder did nothing. The handler must live in the global mouse chain: a
+  -- buffer-local mapping only applies once the sidebar already has focus, so
+  -- the first click on an unfocused sidebar was swallowed as a focus change.
+  state = open("explorer")
+  local list = state.content.picker.list
+  assert(
+    vim.wait(5000, function()
+      return list:count() > 0
+    end),
+    "the Explorer list stayed empty"
+  )
+  local folder_row
+  for index = 1, list:count() do
+    local item = list:get(index)
+    if item and item.dir and index > 1 then
+      folder_row = index
+      break
+    end
+  end
+  assert(folder_row, "no collapsed folder to click")
+  local before = list:count()
+  local screen = vim.fn.screenpos(list.win.win, folder_row, 1)
+  -- Click from the editor, i.e. with the sidebar unfocused.
+  vim.api.nvim_set_current_win(assert(ActivityBar.editor_window()))
+  assert(
+    ActivityBar._handle_list_click({
+      winid = list.win.win,
+      line = folder_row,
+      screenrow = screen.row,
+      screencol = screen.col,
+    }),
+    "a single click on a folder was not handled"
+  )
+  assert(
+    vim.wait(5000, function()
+      return list:count() ~= before
+    end),
+    "a single click on a folder did not toggle it"
+  )
+
   -- Losing the Activity Bar column must take its sidebar down with it.
   local tab = state.tab
   vim.api.nvim_win_close(state.activity.win, true)

@@ -1449,6 +1449,9 @@ local function setup_global_mouse_mappings()
       if scrollbar and scrollbar.handle_mouse and scrollbar.handle_mouse(mouse) then
         return ""
       end
+      if activity and activity._handle_list_click and activity._handle_list_click(mouse) then
+        return ""
+      end
       queue_terminal_insert(mouse and mouse.winid)
       return key
     end, { expr = true, silent = true, desc = "Toggle or open Git panel item" })
@@ -2040,7 +2043,6 @@ function M.open(explorer, root, attempt, open_opts)
   vim.wo[win].list = false
   vim.wo[win].winfixheight = not target_win
   vim.wo[win].winfixwidth = target_win ~= nil
-
   local state = {
     buf = buf,
     win = win,
