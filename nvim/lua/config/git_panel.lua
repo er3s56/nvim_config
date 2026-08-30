@@ -2523,6 +2523,8 @@ vim.api.nvim_create_autocmd("BufEnter", {
   end,
 })
 
+M._states = states
+M._commit_depths = commit_depths
 M._display_path = display_path
 M._render = render
 M._workspace_path = workspace_path
