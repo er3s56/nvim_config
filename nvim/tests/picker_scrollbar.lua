@@ -90,10 +90,10 @@ local ok, test_error = pcall(function()
   -- list by real screen rows, release disarms.
   picker.list:scroll(1, true, true)
   vim.wait(300)
-  local current_bar
+  local current_bar, current_list_win
   for list_win, entry in pairs(Scrollbar._bars) do
     if vim.api.nvim_win_is_valid(list_win) and vim.api.nvim_win_is_valid(entry.win) then
-      current_bar = entry
+      current_bar, current_list_win = entry, list_win
     end
   end
   assert(current_bar, "no bar to drag")
@@ -116,6 +116,47 @@ local ok, test_error = pcall(function()
     not Scrollbar.handle_drag({ screenrow = bar_position[1], screencol = bar_position[2] }),
     "a drag leaked past release"
   )
+
+  -- Everything above calls the handlers directly, which says nothing about
+  -- whether a real drag can reach them. It could not: the panels used to map
+  -- <LeftDrag> and <LeftRelease> buffer-locally to <Nop> so that dragging
+  -- would not start a selection, and a buffer-local mapping wins over a global
+  -- one -- so with a panel focused, which is the normal case, the press armed
+  -- a drag that then never moved and never ended. Resolve the keys the way
+  -- Neovim will, from inside the panel.
+  assert(vim.api.nvim_win_is_valid(current_list_win), "the list window closed")
+  vim.api.nvim_set_current_win(current_list_win)
+  for _, key in ipairs({ "<LeftDrag>", "<LeftRelease>" }) do
+    local mapping = vim.fn.maparg(key, "n", false, true)
+    assert(
+      mapping.buffer == 0,
+      ("%s resolves to a buffer-local mapping inside a panel, shadowing the scrollbar"):format(key)
+    )
+    assert(mapping.callback, ("%s is not routed through a handler"):format(key))
+    assert(mapping.rhs ~= "<Nop>", ("%s is swallowed before the scrollbar sees it"):format(key))
+  end
+
+  -- ...and that the mapping it does resolve to actually offers the event to
+  -- the scrollbar, rather than swallowing it as panel text selection.
+  local reached = {}
+  local real_drag, real_release = Scrollbar.handle_drag, Scrollbar.handle_release
+  Scrollbar.handle_drag = function()
+    reached.drag = true
+    return true
+  end
+  Scrollbar.handle_release = function()
+    reached.release = true
+    return true
+  end
+  local routed = pcall(function()
+    for key, name in pairs({ ["<LeftDrag>"] = "drag", ["<LeftRelease>"] = "release" }) do
+      local mapping = vim.fn.maparg(key, "n", false, true)
+      assert(mapping.callback() == "", ("%s was not swallowed once the scrollbar consumed it"):format(key))
+      assert(reached[name], ("%s never reached the scrollbar"):format(key))
+    end
+  end)
+  Scrollbar.handle_drag, Scrollbar.handle_release = real_drag, real_release
+  assert(routed, "the drag gestures are not routed to the scrollbar")
 
   -- The bar dies with its view.
   ActivityBar.open("git", { focus = false })

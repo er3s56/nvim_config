@@ -66,9 +66,11 @@ end
 -- panel buffer. Buffer-local is safe here because each of these gestures
 -- follows a press that already focused the window, so the panel's buffer is
 -- current by the time they arrive.
+-- Deliberately not <LeftDrag>/<LeftRelease>: a buffer-local mapping wins over
+-- a global one, so a <Nop> here would shadow the scrollbar's drag handlers
+-- whenever a panel has focus -- which is most of the time you would drag one.
+-- Those two are swallowed globally instead, in `setup` below.
 local SELECTION_GESTURES = {
-  "<LeftDrag>",
-  "<LeftRelease>",
   "<2-LeftMouse>",
   "<3-LeftMouse>",
   "<4-LeftMouse>",
@@ -1561,6 +1563,43 @@ function M.setup()
     silent = true,
     desc = "Activate Activity Bar item",
   })
+
+  -- Dragging a scrollbar is a legitimate gesture inside a panel, and the press
+  -- that started it has already been consumed by the hub above. Offer drag and
+  -- release to the scrollbar before swallowing them, or the handle stops
+  -- following the mouse and the drag never ends -- which also leaves the next
+  -- drag anywhere on screen still steering the panel it was armed on.
+  for _, gesture in ipairs({
+    {
+      key = "<LeftDrag>",
+      consume = function(scrollbar, mouse)
+        return scrollbar.handle_drag and scrollbar.handle_drag(mouse)
+      end,
+    },
+    {
+      key = "<LeftRelease>",
+      consume = function(scrollbar)
+        return scrollbar.handle_release and scrollbar.handle_release()
+      end,
+    },
+  }) do
+    local key = gesture.key
+    local consume = gesture.consume
+    vim.keymap.set({ "n", "x", "i", "t" }, key, function()
+      local mouse = vim.fn.getmousepos()
+      local scrollbar = package.loaded["config.picker_scrollbar"]
+      if scrollbar and consume(scrollbar, mouse) then
+        return ""
+      end
+      if M._over_panel(mouse) then
+        return ""
+      end
+      if scrollbar and scrollbar._over_terminal and scrollbar._over_terminal(mouse) then
+        return ""
+      end
+      return key
+    end, { expr = true, silent = true, desc = "Drag a panel scrollbar, but never select panel text" })
+  end
 
   -- Multi-click gestures select a word or a line. Inside a panel that is
   -- meaningless and strands it in Visual mode, so swallow them there. This

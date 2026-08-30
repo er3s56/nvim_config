@@ -268,19 +268,51 @@ local ok, test_error = pcall(function()
   )
 
   -- Dragging in a panel used to start a Visual selection over the file tree.
-  for _, window in ipairs({ state.content.picker.list.win, state.content.picker.input.win }) do
-    local buf = window.buf
-    for _, key in ipairs({ "<LeftDrag>", "<LeftRelease>" }) do
-      local found
-      for _, map in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
-        if map.lhs == key then
-          found = map
-        end
+  -- Assert what happens, not how: these gestures cannot be neutralised with a
+  -- buffer-local mapping, because that would also win over the sidebar
+  -- scrollbar's drag handling. They are swallowed by whichever global mapping
+  -- is in force, and several modules install one, each shadowing the last in
+  -- whatever order the panels happened to be opened.
+  local real_getmousepos = vim.fn.getmousepos
+  local function swallowed(win, key)
+    vim.fn.getmousepos = function()
+      return { winid = win, screenrow = 1, screencol = 1, winrow = 1, wincol = 1, line = 1, column = 1 }
+    end
+    local mapping = vim.fn.maparg(key, "n", false, true)
+    local produced = mapping.callback and mapping.callback() or mapping.rhs
+    vim.fn.getmousepos = real_getmousepos
+    return produced == ""
+  end
+
+  local function assert_panels_swallow(picker, when)
+    for _, window in ipairs({ picker.list.win, picker.input.win }) do
+      for _, key in ipairs({ "<LeftDrag>", "<LeftRelease>" }) do
+        assert(swallowed(window.win, key), ("%s selects panel text %s"):format(key, when))
       end
-      assert(found, ("%s is not neutralised in the panel"):format(key))
-      assert((found.rhs or "") == "", ("%s does something other than nothing"):format(key))
     end
   end
+
+  assert_panels_swallow(state.content.picker, "in the Explorer")
+
+  -- The Git panel installs global drag mappings of its own and never removes
+  -- them, so from the first time it is opened it answers for every panel,
+  -- including the two it knows nothing about.
+  ActivityBar.open("git", { focus = false })
+  assert(
+    vim.wait(10000, function()
+      return require("config.git_panel").current() ~= nil
+    end),
+    "the Git panel never opened"
+  )
+  state = ActivityBar.open("explorer", { focus = false })
+  assert(
+    vim.wait(10000, function()
+      local picker = state.content and state.content.picker
+      return picker ~= nil and picker.list ~= nil and picker.list.win:valid()
+    end),
+    "the Explorer never came back"
+  )
+  assert_panels_swallow(state.content.picker, "once the Git panel has been opened")
 
   -- Losing the Activity Bar column must take its sidebar down with it.
   local tab = state.tab

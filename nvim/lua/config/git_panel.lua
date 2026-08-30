@@ -1377,6 +1377,24 @@ local function queue_terminal_insert(win, opts)
   end)
 end
 
+-- These mappings are global and are never removed, so once a Git panel has
+-- been opened they permanently shadow the Activity Bar's own drag handling --
+-- including for the Explorer and Search panels, which this module knows
+-- nothing about. Hand anything not ours back to the Activity Bar's rule
+-- before letting it through, or dragging inside those panels starts selecting
+-- their text again.
+local function swallow_outside_panel(mouse, key)
+  local activity = package.loaded["config.activity_bar"]
+  if activity and activity._over_panel and activity._over_panel(mouse) then
+    return ""
+  end
+  local scrollbar = package.loaded["config.picker_scrollbar"]
+  if scrollbar and scrollbar._over_terminal and scrollbar._over_terminal(mouse) then
+    return ""
+  end
+  return key
+end
+
 local function mouse_panel_target()
   local mouse = vim.fn.getmousepos()
   for buf, state in pairs(states) do
@@ -1580,14 +1598,18 @@ local function setup_global_mouse_mappings()
     if scrollbar and scrollbar.handle_drag and scrollbar.handle_drag(mouse) then
       return ""
     end
-    return "<LeftDrag>"
+    return swallow_outside_panel(mouse, "<LeftDrag>")
   end, { expr = true, silent = true, desc = "Position Git panel cursor" })
   vim.keymap.set({ "n", "x", "i" }, "<LeftRelease>", function()
     local scrollbar = package.loaded["config.picker_scrollbar"]
     if scrollbar and scrollbar.handle_release and scrollbar.handle_release() then
       return ""
     end
-    return mouse_panel_target() and "" or "<LeftRelease>"
+    local state, mouse = mouse_panel_target()
+    if state then
+      return ""
+    end
+    return swallow_outside_panel(mouse, "<LeftRelease>")
   end, { expr = true, silent = true, desc = "Finish Git panel click" })
 
   -- This is also the synchronisation path when the mouse is over a diff that
