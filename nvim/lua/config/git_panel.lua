@@ -10,6 +10,7 @@ local M = {}
 local COMMIT_BATCH = 200
 local states = {}
 local load_commits
+local drop_stale_worktree_preview
 local ns = vim.api.nvim_create_namespace("project_git_panel")
 local resize_generation = 0
 local reflowing_layout = false
@@ -348,6 +349,7 @@ function M.refresh(buf, opts)
       return
     end
     state.branch, state.changes = parse_status(output)
+    drop_stale_worktree_preview(state)
     render(state)
   end, false)
 
@@ -647,6 +649,33 @@ local function entry_key(entry)
     entry.old_path or "",
     entry.path or "",
   }, "\0")
+end
+
+-- A worktree diff describes how a file currently differs from the index or
+-- HEAD. Once the file stops being a change -- staged, reverted, committed,
+-- deleted -- that difference no longer exists, but the preview stays on
+-- screen showing it, next to a CHANGES list that now says the tree is clean.
+--
+-- Only worktree previews go stale this way. A commit's contents do not
+-- change, so a commit diff stays valid however the working tree moves.
+function drop_stale_worktree_preview(state)
+  local live = {}
+  for _, change in ipairs(state.changes or {}) do
+    live[entry_key(change)] = true
+  end
+  -- Cached previews go too, not just the visible one: the cache is keyed by
+  -- entry, so a file that comes back with the same status would be served its
+  -- old contents out of it.
+  local stale = {}
+  for key, preview in pairs(state.previews or {}) do
+    local entry = preview.entry
+    if entry and entry.kind == "worktree_file" and not live[key] then
+      stale[#stale + 1] = preview
+    end
+  end
+  for _, preview in ipairs(stale) do
+    delete_preview(state, preview)
+  end
 end
 
 local function diff_edge_filler(win, direction)
