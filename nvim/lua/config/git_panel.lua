@@ -12,7 +12,11 @@ local COMMIT_BATCH = 200
 local states = {}
 local load_commits
 local drop_stale_worktree_preview
+local reload_preview
 local ns = vim.api.nvim_create_namespace("project_git_panel")
+-- The hunk buttons live in the diff buffers, which the panel does not own the
+-- highlights of, so they get a namespace that can be cleared on its own.
+local hunk_ns = vim.api.nvim_create_namespace("project_git_panel_hunks")
 local resize_generation = 0
 local reflowing_layout = false
 local explorer_preferred_widths = setmetatable({}, { __mode = "k" })
@@ -43,6 +47,14 @@ local function run_git(root, args, callback, text)
   local cmd = { "git", "--no-optional-locks", "-C", root }
   vim.list_extend(cmd, args)
   run(cmd, callback, text)
+end
+
+local function notify_error(message)
+  if rawget(_G, "Snacks") and Snacks.notify then
+    Snacks.notify.error(message)
+  else
+    vim.notify(message, vim.log.levels.ERROR)
+  end
 end
 
 local function display_path(path, width)
@@ -803,6 +815,13 @@ local function content_lines(content)
   return #lines > 0 and lines or { "" }
 end
 
+local function set_preview_content(buf, path, content)
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, content_lines(content))
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].filetype = vim.filetype.match({ filename = path }) or ""
+end
+
 local function update_preview_buffer(buf, name, path, content)
   vim.api.nvim_buf_set_name(buf, name)
   vim.bo[buf].buftype = "nofile"
@@ -812,10 +831,7 @@ local function update_preview_buffer(buf, name, path, content)
   -- Keep Snacks Explorer from treating this nofile buffer as a missing main
   -- editor and selecting the Git panel or terminal as its replacement.
   vim.b[buf].snacks_main = true
-  vim.bo[buf].modifiable = true
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, content_lines(content))
-  vim.bo[buf].modifiable = false
-  vim.bo[buf].filetype = vim.filetype.match({ filename = path }) or ""
+  set_preview_content(buf, path, content)
 end
 
 local function preview_buffer(listed, name, path, content)
@@ -842,22 +858,40 @@ end
 -- Only worktree previews go stale this way. A commit's contents do not
 -- change, so a commit diff stays valid however the working tree moves.
 function drop_stale_worktree_preview(state)
-  local live = {}
+  local live, by_path = {}, {}
   for _, change in ipairs(state.changes or {}) do
     live[entry_key(change)] = true
+    by_path[change.path] = change
   end
-  -- Cached previews go too, not just the visible one: the cache is keyed by
-  -- entry, so a file that comes back with the same status would be served its
-  -- old contents out of it.
-  local stale = {}
+  -- Cached previews are reconciled too, not just the visible one: the cache is
+  -- keyed by entry, so a file that comes back with the same status would
+  -- otherwise be served its old contents out of it.
+  local stale, surviving = {}, {}
   for key, preview in pairs(state.previews or {}) do
     local entry = preview.entry
-    if entry and entry.kind == "worktree_file" and not live[key] then
-      stale[#stale + 1] = preview
+    if entry and entry.kind == "worktree_file" then
+      local replacement = by_path[entry.path]
+      if replacement then
+        surviving[#surviving + 1] = { preview = preview, key = key, entry = replacement, moved = not live[key] }
+      else
+        stale[#stale + 1] = preview
+      end
     end
   end
   for _, preview in ipairs(stale) do
     delete_preview(state, preview)
+  end
+  for _, item in ipairs(surviving) do
+    -- Staging one hunk of a modified file moves it from " M" to "MM", which is
+    -- a different entry and so a different key. Re-key and re-read rather than
+    -- closing: VSCode leaves the diff editor open across a staged hunk, and the
+    -- window the reader is working in has no business disappearing under them.
+    if item.moved then
+      state.previews[item.key] = nil
+      item.preview.key = entry_key(item.entry)
+      state.previews[item.preview.key] = item.preview
+    end
+    reload_preview(state, item.preview, item.entry)
   end
 end
 
@@ -1270,7 +1304,103 @@ activate_preview = function(state, preview, focus_preview)
   state.updating_preview = false
 end
 
-local function show_preview(state, entry, key, before, after, before_label, after_label, focus_preview)
+-- ── hunks inside the diff ───────────────────────────────────────────────
+
+local HUNK_ACTIONS = {
+  stage = { glyph = "+", label = "Stage Hunk" },
+  unstage = { glyph = "−", label = "Unstage Hunk" },
+  discard = { glyph = "↺", label = "Discard Hunk" },
+}
+
+-- Which hunk operations a diff supports. Only an edit still in flight can be
+-- moved: a commit's contents are history, and an untracked file has no earlier
+-- version to throw a hunk back to.
+local function hunk_actions(mode)
+  if mode == "unstaged" then
+    return { "discard", "stage" }
+  elseif mode == "staged" then
+    return { "unstage" }
+  elseif mode == "untracked" then
+    return { "stage" }
+  end
+  return {}
+end
+
+local function prepare_hunks(preview)
+  preview.hunks = {}
+  preview.hunk_marks = {}
+  if #hunk_actions(preview.mode) == 0 then
+    return
+  end
+  if GitOps.is_binary(preview.before) or GitOps.is_binary(preview.after) then
+    return
+  end
+  preview.hunks = GitOps.hunks(preview.before, preview.after)
+end
+
+-- The buttons are virtual text at the end of the hunk's first line: the diff
+-- buffers have to stay byte-identical to what git produced, so nothing may be
+-- written into them. They are spaced out on purpose -- a click reports a screen
+-- column, the column virtual text begins at can only be derived, and a cell of
+-- slack between two buttons makes an off-by-one land on nothing instead of on
+-- the wrong action.
+local HUNK_BUTTON_GAP = 3
+
+local function render_hunk_buttons(state, preview)
+  local buf = preview.bufs and preview.bufs[2]
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+  vim.api.nvim_buf_clear_namespace(buf, hunk_ns, 0, -1)
+  preview.hunk_marks = {}
+  local actions = hunk_actions(preview.mode)
+  if #actions == 0 then
+    return
+  end
+  local total = vim.api.nvim_buf_line_count(buf)
+  for _, hunk in ipairs(preview.hunks or {}) do
+    -- A hunk that only deletes has no line of its own on this side, so it
+    -- belongs to the line it follows.
+    local line = math.max(1, math.min(hunk.after_start, total))
+    local strip, ranges = "", {}
+    for index, name in ipairs(actions) do
+      strip = strip .. string.rep(" ", index == 1 and 2 or HUNK_BUTTON_GAP)
+      local at = vim.fn.strdisplaywidth(strip) + 1
+      strip = strip .. HUNK_ACTIONS[name].glyph
+      ranges[#ranges + 1] = { from = at - 1, to = at + 1, action = name, hunk = hunk }
+    end
+    vim.api.nvim_buf_set_extmark(buf, hunk_ns, line - 1, 0, {
+      virt_text = { { strip, "Special" } },
+      virt_text_pos = "eol",
+      hl_mode = "combine",
+    })
+    preview.hunk_marks[line] = ranges
+  end
+end
+
+-- Virtual text is not part of the line, so a click on it reports the buffer
+-- line and a screen column and nothing more. The strip begins in the cell
+-- after the line's last character, which is where the cursor would sit at the
+-- end of the line.
+local function hunk_button_at(state, preview, mouse)
+  local layout = state.preview_layout
+  local ranges = preview.hunk_marks and mouse and preview.hunk_marks[mouse.line]
+  if not ranges or not layout or mouse.winid ~= layout.after_win then
+    return
+  end
+  local text = vim.api.nvim_buf_get_lines(preview.bufs[2], mouse.line - 1, mouse.line, false)[1] or ""
+  local position = vim.fn.screenpos(layout.after_win, mouse.line, #text + 1)
+  if position.row == 0 or position.row ~= mouse.screenrow then
+    return
+  end
+  for _, range in ipairs(ranges) do
+    if mouse.screencol >= position.col + range.from - 1 and mouse.screencol <= position.col + range.to - 1 then
+      return range
+    end
+  end
+end
+
+local function show_preview(state, entry, key, before, after, specs, focus_preview)
   if not valid(state) then
     return
   end
@@ -1297,10 +1427,15 @@ local function show_preview(state, entry, key, before, after, before_label, afte
     entry = entry,
     bufs = { before_buf, after_buf },
     views = {},
-    before_label = before_label,
-    after_label = after_label,
+    mode = specs.mode,
+    before = before,
+    after = after,
+    before_label = specs.before_label,
+    after_label = specs.after_label,
   }
   state.previews[key] = preview
+  prepare_hunks(preview)
+  render_hunk_buttons(state, preview)
 
   for _, buf in ipairs(preview.bufs) do
     vim.keymap.set("n", "<ScrollWheelDown>", function()
@@ -1321,6 +1456,15 @@ local function show_preview(state, entry, key, before, after, before_label, afte
       silent = true,
       desc = "Scroll both Git diff windows up",
     })
+    for _, item in ipairs({
+      { key = "a", action = "stage", desc = "Stage the hunk under the cursor" },
+      { key = "u", action = "unstage", desc = "Unstage the hunk under the cursor" },
+      { key = "x", action = "discard", desc = "Discard the hunk under the cursor" },
+    }) do
+      vim.keymap.set("n", item.key, function()
+        M._hunk_action_at_cursor(item.action)
+      end, { buffer = buf, silent = true, desc = item.desc })
+    end
   end
   vim.api.nvim_create_autocmd({ "BufDelete", "BufWipeout" }, {
     once = true,
@@ -1351,6 +1495,89 @@ local function read_blob(root, spec, callback)
   run_git(root, { "show", spec }, callback, false)
 end
 
+-- What a row's diff compares, and what that makes it: an edit still in flight
+-- (which can be staged, unstaged or thrown away) or a piece of history.
+local function preview_specs(entry)
+  local status = entry.status
+  if entry.kind == "commit_file" then
+    local code = status:sub(1, 1)
+    return {
+      mode = "commit",
+      before_spec = code ~= "A" and (entry.commit .. "^1:" .. (entry.old_path or entry.path)) or nil,
+      after_spec = code ~= "D" and (entry.commit .. ":" .. entry.path) or nil,
+      before_label = "Before · " .. entry.short_hash .. "^",
+      after_label = "After · " .. entry.short_hash,
+    }
+  end
+  local index_status, worktree_status = status:sub(1, 1), status:sub(2, 2)
+  if status == "??" then
+    return {
+      mode = "untracked",
+      after_worktree = entry.path,
+      before_label = "Before · empty",
+      after_label = "After · worktree",
+    }
+  end
+  if worktree_status ~= " " then
+    return {
+      mode = "unstaged",
+      before_spec = ":" .. (entry.old_path or entry.path),
+      after_worktree = worktree_status ~= "D" and entry.path or nil,
+      before_label = "Before · index",
+      after_label = "After · worktree",
+    }
+  end
+  return {
+    mode = "staged",
+    before_spec = index_status ~= "A" and ("HEAD:" .. (entry.old_path or entry.path)) or nil,
+    after_spec = index_status ~= "D" and (":" .. entry.path) or nil,
+    before_label = "Before · HEAD",
+    after_label = "After · index",
+  }
+end
+
+-- Both sides of a diff, read together. A side that is simply absent is not an
+-- error -- a file that was added has no previous version -- but a side git
+-- refuses to produce is, and the caller is told which one.
+local function read_sides(root, path, specs, callback)
+  local before, after, failure
+  local before_done, after_done = false, false
+  local function finish()
+    if before_done and after_done then
+      callback(before, after, failure)
+    end
+  end
+  local function receive(side)
+    return function(output, code, stderr)
+      if code ~= 0 and not failure then
+        local detail = vim.trim(stderr or "")
+        failure = ("Git could not read `%s` (%s, exit %s)%s"):format(
+          path,
+          side,
+          code,
+          detail ~= "" and ": " .. detail or ""
+        )
+      end
+      if side == "before" then
+        before, before_done = output, true
+      else
+        after, after_done = output, true
+      end
+      finish()
+    end
+  end
+  if specs.before_worktree then
+    read_worktree(root, specs.before_worktree, receive("before"))
+  else
+    read_blob(root, specs.before_spec, receive("before"))
+  end
+  if specs.after_worktree then
+    read_worktree(root, specs.after_worktree, receive("after"))
+  else
+    read_blob(root, specs.after_spec, receive("after"))
+  end
+end
+
 local function open_file_preview(state, entry, focus_preview)
   local key = entry_key(entry)
   local existing = state.previews[key]
@@ -1374,85 +1601,67 @@ local function open_file_preview(state, entry, focus_preview)
   local generation = state.preview_generation
   state.preview_request_key = key
   state.preview_request_focus = focus_preview
-  local before_spec, after_spec, before_worktree, after_worktree
-  local before_label, after_label
-  local status = entry.status
+  local specs = preview_specs(entry)
 
-  if entry.kind == "commit_file" then
-    local code = status:sub(1, 1)
-    if code ~= "A" then
-      before_spec = entry.commit .. "^1:" .. (entry.old_path or entry.path)
-    end
-    if code ~= "D" then
-      after_spec = entry.commit .. ":" .. entry.path
-    end
-    before_label = "Before · " .. entry.short_hash .. "^"
-    after_label = "After · " .. entry.short_hash
-  else
-    local index_status, worktree_status = status:sub(1, 1), status:sub(2, 2)
-    if status == "??" then
-      after_worktree = entry.path
-      before_label, after_label = "Before · empty", "After · worktree"
-    elseif worktree_status ~= " " then
-      before_spec = ":" .. (entry.old_path or entry.path)
-      if worktree_status ~= "D" then
-        after_worktree = entry.path
-      end
-      before_label, after_label = "Before · index", "After · worktree"
-    else
-      if index_status ~= "A" then
-        before_spec = "HEAD:" .. (entry.old_path or entry.path)
-      end
-      if index_status ~= "D" then
-        after_spec = ":" .. entry.path
-      end
-      before_label, after_label = "Before · HEAD", "After · index"
-    end
-  end
-
-  local before, after, before_error, after_error
-  local before_code, after_code, before_stderr, after_stderr
-  local before_done, after_done = false, false
-  local function finish()
-    if not before_done or not after_done or not valid(state) or state.preview_generation ~= generation then
+  read_sides(state.root, entry.path, specs, function(before, after, err)
+    if not valid(state) or state.preview_generation ~= generation then
       return
     end
     local should_focus = state.preview_request_focus
     state.preview_request_key = nil
     state.preview_request_focus = nil
-    if before_error or after_error then
-      local side = before_error and "before" or "after"
-      local code = before_error and before_code or after_code
-      local stderr = vim.trim(before_error and before_stderr or after_stderr or "")
-      local detail = stderr ~= "" and (": " .. stderr) or ""
-      Snacks.notify.error(("Git could not read `%s` (%s, exit %s)%s"):format(entry.path, side, code, detail))
+    if err then
+      Snacks.notify.error(err)
       return
     end
-    show_preview(state, entry, key, before or "", after or "", before_label, after_label, should_focus)
-  end
-  local function before_callback(output, code, stderr)
-    before, before_done = output, true
-    before_code, before_stderr = code, stderr
-    before_error = code ~= 0
-    finish()
-  end
-  local function after_callback(output, code, stderr)
-    after, after_done = output, true
-    after_code, after_stderr = code, stderr
-    after_error = code ~= 0
-    finish()
-  end
+    show_preview(state, entry, key, before or "", after or "", specs, should_focus)
+  end)
+end
 
-  if before_worktree then
-    read_worktree(state.root, before_worktree, before_callback)
-  else
-    read_blob(state.root, before_spec, before_callback)
-  end
-  if after_worktree then
-    read_worktree(state.root, after_worktree, after_callback)
-  else
-    read_blob(state.root, after_spec, after_callback)
-  end
+-- Bring an open diff back in step with the repository. Both sides are read
+-- again and written only where they differ: the reader may be scrolled into
+-- the middle of the file, and replacing lines that did not change would throw
+-- that away for nothing.
+function reload_preview(state, preview, entry)
+  local specs = preview_specs(entry)
+  preview.reload_serial = (preview.reload_serial or 0) + 1
+  local serial = preview.reload_serial
+  read_sides(state.root, entry.path, specs, function(before, after, err)
+    if not valid(state) or not valid_preview(preview) or preview.reload_serial ~= serial then
+      return
+    end
+    if err then
+      return notify_error(err)
+    end
+    before, after = before or "", after or ""
+    local changed = preview.before ~= before or preview.after ~= after or preview.mode ~= specs.mode
+    preview.entry = entry
+    preview.mode = specs.mode
+    preview.before, preview.after = before, after
+    preview.before_label, preview.after_label = specs.before_label, specs.after_label
+    if not changed then
+      return
+    end
+    set_preview_content(preview.bufs[1], entry.old_path or entry.path, before)
+    set_preview_content(preview.bufs[2], entry.path, after)
+    prepare_hunks(preview)
+    render_hunk_buttons(state, preview)
+    local layout = state.preview_layout
+    if not layout or state.preview ~= preview then
+      return
+    end
+    for _, item in ipairs({
+      { win = layout.main_win, label = preview.before_label },
+      { win = layout.after_win, label = preview.after_label },
+    }) do
+      if vim.api.nvim_win_is_valid(item.win) then
+        vim.wo[item.win].winbar = "  " .. item.label
+        pcall(vim.api.nvim_win_call, item.win, function()
+          vim.cmd("diffupdate")
+        end)
+      end
+    end
+  end)
 end
 
 local function load_commit_files(state, commit)
@@ -1653,14 +1862,6 @@ end
 
 -- ── acting on a change ──────────────────────────────────────────────────
 
-local function notify_error(message)
-  if rawget(_G, "Snacks") and Snacks.notify then
-    Snacks.notify.error(message)
-  else
-    vim.notify(message, vim.log.levels.ERROR)
-  end
-end
-
 -- The paths to hand git. A rename is two entries in the index, so taking one
 -- back out has to name both or the old path stays deleted there.
 local function action_paths(action, changes)
@@ -1718,6 +1919,18 @@ local function cursor_mouse(state)
   }
 end
 
+local function confirm(state, prompt, label, mouse, proceed)
+  ContextMenu.open({
+    { label = prompt, enabled = false },
+    { separator = true },
+    { label = label, action = proceed },
+    { label = "Cancel", action = function() end },
+  }, mouse or cursor_mouse(state), {
+    filetype = "git_panel_confirm",
+    min_width = math.min(vim.api.nvim_strwidth(prompt) + 4, math.max(vim.o.columns - 4, 20)),
+  })
+end
+
 -- Discarding is the one action here that destroys work no git command can
 -- bring back, so it asks first -- and says what exactly will be lost, because
 -- "discard 12 files" and "delete a file git has never seen" are not the same
@@ -1734,15 +1947,7 @@ local function confirm_discard(state, changes, mouse, proceed)
   if deletions > 0 then
     prompt = ("Discard %s? %d untracked file(s) will be deleted."):format(subject, deletions)
   end
-  ContextMenu.open({
-    { label = prompt, enabled = false },
-    { separator = true },
-    { label = "Discard Changes", action = proceed },
-    { label = "Cancel", action = function() end },
-  }, mouse or cursor_mouse(state), {
-    filetype = "git_panel_confirm",
-    min_width = math.min(vim.api.nvim_strwidth(prompt) + 4, math.max(vim.o.columns - 4, 20)),
-  })
+  confirm(state, prompt, "Discard Changes", mouse, proceed)
 end
 
 local function activate_action(state, action, entry, scope, mouse)
@@ -1778,6 +1983,89 @@ local function activate_click(state, mouse)
     return action(state, false)
   end
   activate_action(state, range.action, range.entry, range.scope, mouse)
+end
+
+-- ── acting on a hunk ────────────────────────────────────────────────────
+
+local function preview_at_window(win)
+  for buf, state in pairs(states) do
+    if not valid(state) then
+      states[buf] = nil
+    else
+      local layout = state.preview_layout
+      local shown = layout and win and (win == layout.main_win or win == layout.after_win)
+      if shown and valid_preview(state.preview) then
+        return state, state.preview, win == layout.after_win and "after" or "before"
+      end
+    end
+  end
+end
+
+local function run_hunk_action(state, preview, name, hunk)
+  local entry = preview.entry
+  -- The diff the reader is looking at is what the hunk's line numbers mean, so
+  -- it is what git_ops checks the repository against before writing anything.
+  local expected = { before = preview.before, after = preview.after }
+  local buf = state.buf
+  local function finished(err)
+    if err then
+      notify_error(err)
+    end
+    M.refresh(buf, { status_only = true })
+  end
+  if name == "stage" then
+    GitOps.stage_hunk(state.root, entry.path, hunk, expected, finished)
+  elseif name == "unstage" then
+    GitOps.unstage_hunk(state.root, entry.path, hunk, expected, finished)
+  elseif name == "discard" then
+    GitOps.discard_hunk(state.root, entry.path, hunk, expected, finished)
+  end
+end
+
+local function activate_hunk_action(state, preview, name, hunk, mouse)
+  if not hunk or not vim.tbl_contains(hunk_actions(preview.mode), name) then
+    return
+  end
+  if name ~= "discard" then
+    return run_hunk_action(state, preview, name, hunk)
+  end
+  local prompt = ("Discard this hunk of `%s`?"):format(preview.entry.path)
+  confirm(state, prompt, "Discard Hunk", mouse, function()
+    run_hunk_action(state, preview, name, hunk)
+  end)
+end
+
+-- Split in two on purpose: the hit test is all an <expr> mapping may do under
+-- textlock, and acting on the result has to wait for the event to finish.
+local function preview_button_hit(mouse)
+  local state, preview, side = preview_at_window(mouse and mouse.winid)
+  if not state or side ~= "after" then
+    return
+  end
+  local range = hunk_button_at(state, preview, mouse)
+  if range then
+    return range, state, preview
+  end
+end
+
+function M._handle_preview_click(mouse)
+  local range, state, preview = preview_button_hit(mouse)
+  if not range then
+    return false
+  end
+  activate_hunk_action(state, preview, range.action, range.hunk, mouse)
+  return true
+end
+
+-- The same three actions from the keyboard, on the hunk under the cursor.
+function M._hunk_action_at_cursor(name)
+  local win = vim.api.nvim_get_current_win()
+  local state, preview, side = preview_at_window(win)
+  if not state then
+    return
+  end
+  local line = vim.api.nvim_win_get_cursor(win)[1]
+  activate_hunk_action(state, preview, name, GitOps.hunk_at(preview.hunks or {}, side, line))
 end
 
 -- ── the hovered row ─────────────────────────────────────────────────────
@@ -1907,6 +2195,43 @@ local function action_spec(name)
   end
 end
 
+-- The diff's own menu: what can be done to the hunk that was clicked, then
+-- the same three actions for the whole file the diff belongs to.
+local function preview_context_entries(state, preview, side, mouse)
+  local entries = {}
+  local available = hunk_actions(preview.mode)
+  local hunk = GitOps.hunk_at(preview.hunks or {}, side, mouse.line)
+  for _, name in ipairs({ "stage", "unstage", "discard" }) do
+    if vim.tbl_contains(available, name) then
+      entries[#entries + 1] = {
+        label = HUNK_ACTIONS[name].label,
+        enabled = hunk ~= nil,
+        action = function()
+          activate_hunk_action(state, preview, name, hunk, mouse)
+        end,
+      }
+    end
+  end
+
+  local entry = preview.entry
+  if entry.kind == "worktree_file" then
+    local allowed = GitOps.file_actions(entry.status)
+    if #entries > 0 then
+      entries[#entries + 1] = { separator = true }
+    end
+    for _, name in ipairs({ "stage", "unstage", "discard" }) do
+      entries[#entries + 1] = {
+        label = action_spec(name).label,
+        enabled = allowed[name] == true,
+        action = function()
+          activate_action(state, name, entry, "file", mouse)
+        end,
+      }
+    end
+  end
+  return entries
+end
+
 local function workspace_context_entries(state, entry, mouse)
   local entries = {}
   if entry.kind ~= "section" then
@@ -1989,6 +2314,28 @@ local function setup_context_menu()
       end
     end
   end)
+
+  ContextMenu.register("git_diff", function(mouse)
+    local state, preview, side = preview_at_window(mouse and mouse.winid)
+    if not state or (mouse.line or 0) < 1 then
+      return
+    end
+    local entries = preview_context_entries(state, preview, side, mouse)
+    if #entries == 0 then
+      return
+    end
+    vim.schedule(function()
+      if not valid(state) or not valid_preview(preview) then
+        return
+      end
+      if vim.api.nvim_win_is_valid(mouse.winid) then
+        vim.api.nvim_set_current_win(mouse.winid)
+        pcall(vim.api.nvim_win_set_cursor, mouse.winid, { mouse.line, 0 })
+      end
+      ContextMenu.open(entries, mouse, { filetype = "git_diff_context_menu" })
+    end)
+    return true
+  end)
 end
 
 -- Buffer-local mappings are only resolved from the window that owned focus
@@ -2009,6 +2356,12 @@ local function setup_global_mouse_mappings()
           if position_panel_mouse(state, mouse) then
             activate_click(state, mouse)
           end
+        end)
+        return ""
+      end
+      if key == "<LeftMouse>" and preview_button_hit(mouse) then
+        vim.schedule(function()
+          M._handle_preview_click(mouse)
         end)
         return ""
       end
@@ -3025,6 +3378,9 @@ M._open_workspace_file = open_workspace_file
 M._context_entry_at_mouse = context_entry_at_mouse
 M._entry_buttons = entry_buttons
 M._activate_click = activate_click
+M._preview_button_hit = preview_button_hit
+M._hunk_actions = hunk_actions
+M._preview_context_entries = preview_context_entries
 M._follow_active_row = follow_active_row
 
 return M

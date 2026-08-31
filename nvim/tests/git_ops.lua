@@ -170,6 +170,18 @@ local ok, test_error = pcall(function()
   must(sync(GitOps.discard_hunk, root, "file.txt", hunks[1], sides), "discarding a hunk failed")
   assert(read("file.txt") == "one\ntwo\nthree\nfour\nFIVE\n", "discarding a hunk changed the wrong lines")
 
+  -- A file git has never seen has no previous version, so its whole content is
+  -- one hunk and staging it has to add the index entry rather than replace it.
+  write("added.txt", "alpha\nbeta\n")
+  local fresh = GitOps.hunks("", "alpha\nbeta\n")
+  assert(#fresh == 1, "a new file should be a single hunk")
+  must(
+    sync(GitOps.stage_hunk, root, "added.txt", fresh[1], { before = "", after = "alpha\nbeta\n" }),
+    "staging a hunk of an untracked file failed"
+  )
+  assert(status_of("added.txt") == "A ", "the new file was not added to the index")
+  assert(git({ "show", ":added.txt" }) == "alpha\nbeta\n", "the new file reached the index incomplete")
+
   -- A hunk is a pair of line ranges: once the file has moved on it points at
   -- the wrong lines, and writing anyway would destroy work.
   local stale = sync(GitOps.stage_hunk, root, "file.txt", hunks[1], { before = base, after = "something else\n" })
