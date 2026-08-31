@@ -14,6 +14,12 @@ local function git(args)
   assert(result.code == 0, result.stderr)
 end
 
+-- A picker list only scrolls once it holds more entries than it has rows, and
+-- the click handler this file guards only misbehaved after a scroll.
+for index = 1, 60 do
+  assert(vim.fn.writefile({ "" }, vim.fs.joinpath(root, ("entry-%02d.txt"):format(index))) == 0)
+end
+
 git({ "init", "-q" })
 git({ "config", "user.name", "Activity Bar Test" })
 git({ "config", "user.email", "activity-bar@example.invalid" })
@@ -265,6 +271,62 @@ local ok, test_error = pcall(function()
       return list:count() ~= before
     end),
     "a single click on a folder did not toggle it"
+  )
+
+  -- The list buffer holds only the entries on screen: scrolling rewrites it
+  -- from `list.top` rather than moving the view. A click's buffer line is an
+  -- offset into that window, not an item index, so taking it for one opened
+  -- whichever file had been on that line before the wheel was used.
+  assert(
+    vim.wait(5000, function()
+      return list:count() > list:height()
+    end),
+    "the Explorer never listed more entries than it has rows"
+  )
+  -- A remembered list position is re-applied by the next render, and that
+  -- render happens inside view(), so ask for the next page until it sticks.
+  assert(
+    vim.wait(5000, function()
+      local page = list:height() + 1
+      list:view(page, page, true)
+      return list.top > 1
+    end),
+    "the Explorer list did not scroll"
+  )
+  local file_row, target
+  for row = list:height(), 1, -1 do
+    local candidate = list:get(list:row2idx(row))
+    if candidate and not candidate.dir and candidate.file then
+      file_row, target = row, candidate
+      break
+    end
+  end
+  assert(file_row, "no file was on screen after scrolling the Explorer")
+  local function editor_file()
+    local editor = ActivityBar.editor_window()
+    if not editor then
+      return ""
+    end
+    return vim.fs.normalize(vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(editor)))
+  end
+  local wanted = vim.fs.normalize(target.file)
+  assert(editor_file() ~= wanted, "the file to click was already open")
+  local hit = vim.fn.screenpos(list.win.win, file_row, 1)
+  vim.api.nvim_set_current_win(assert(ActivityBar.editor_window()))
+  assert(
+    ActivityBar._handle_list_click({
+      winid = list.win.win,
+      line = file_row,
+      screenrow = hit.row,
+      screencol = hit.col,
+    }),
+    "a click on a scrolled Explorer was not handled"
+  )
+  assert(
+    vim.wait(5000, function()
+      return editor_file() == wanted
+    end),
+    ("clicking the row showing %s opened %s"):format(wanted, editor_file())
   )
 
   -- Dragging in a panel used to start a Visual selection over the file tree.

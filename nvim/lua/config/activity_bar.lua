@@ -1247,6 +1247,22 @@ function M._over_panel(mouse)
   return filetype == "project_git_panel" or filetype == "activity_git_slot" or filetype == "activity_search_error"
 end
 
+-- The row under the mouse, as an index into the picker's items. The list
+-- window is always scrolled to the top, so the buffer line is an offset from
+-- `list.top` and has to be translated back through the list's own mapping.
+local function list_index_at(list, line)
+  local view = vim.api.nvim_win_call(list.win.win, vim.fn.winsaveview)
+  local row = line - view.topline + 1
+  if row < 1 or row > vim.api.nvim_win_get_height(list.win.win) then
+    return nil
+  end
+  local index = list:row2idx(row)
+  if index < 1 or index > list:count() then
+    return nil
+  end
+  return index
+end
+
 function M._handle_list_click(mouse)
   local state = state_for(tab_for_win(mouse and mouse.winid), false)
   local picker = state and state.content and state.content.picker or nil
@@ -1254,13 +1270,21 @@ function M._handle_list_click(mouse)
   if not list or not list.win or not list.win:valid() or mouse.winid ~= list.win.win then
     return false
   end
-  local row = mouse.line
-  if not row or row < 1 or row > list:count() then
+  local line = mouse.line
+  if not line or line < 1 or line > vim.api.nvim_buf_line_count(list.win.buf) then
     return false
   end
   -- getmousepos() reports the last line for a click below the final entry.
-  local position = vim.fn.screenpos(list.win.win, row, 1)
+  local position = vim.fn.screenpos(list.win.win, line, 1)
   if position.row == 0 or mouse.screenrow ~= position.row then
+    return false
+  end
+  -- The list buffer holds only the entries currently on screen: scrolling
+  -- rewrites it from `list.top` rather than moving the view. A buffer line is
+  -- therefore an offset into that window, not an item index -- taking it for
+  -- one opened whichever file sat at the same offset before the scroll.
+  local index = list_index_at(list, line)
+  if not index then
     return false
   end
   vim.schedule(function()
@@ -1268,7 +1292,7 @@ function M._handle_list_click(mouse)
       return
     end
     vim.api.nvim_set_current_win(list.win.win)
-    list:move(row, true, true)
+    list:move(index, true, true)
     picker:action("confirm")
   end)
   return true
