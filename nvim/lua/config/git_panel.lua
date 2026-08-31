@@ -159,6 +159,19 @@ local function section_text(state, section)
     local label = state.changes == nil and "loading…" or tostring(#state.changes)
     return ("  %s CHANGES  %s"):format(arrow, label)
   end
+  if section == "timeline" then
+    -- The header names the file, the way VSCode's Timeline follows the active
+    -- editor: a list of commits means nothing without knowing whose they are.
+    local timeline = state.timeline or {}
+    local label = "no file"
+    if timeline.path then
+      label = vim.fs.basename(timeline.path)
+      if timeline.commits == nil then
+        label = label .. "  loading…"
+      end
+    end
+    return ("  %s TIMELINE  %s"):format(arrow, label)
+  end
   local label = state.commits == nil and "loading…" or tostring(#state.commits)
   return ("  %s COMMITS  %s"):format(arrow, label)
 end
@@ -328,6 +341,37 @@ local function render(state)
         add("    Loading more commits…", "Comment", { kind = "commit_load_more", loading = true })
       else
         add("  ↓ Load more commits", "Function", { kind = "commit_load_more" })
+      end
+    end
+  end
+
+  -- The history of the file being edited, the way VSCode's Timeline follows
+  -- the active editor. Its rows are commit diffs of one file, so clicking one
+  -- opens exactly what a file under an expanded commit does.
+  add("")
+  add_row({ kind = "section", section = "timeline" })
+  local timeline = state.timeline or {}
+  if not state.collapsed.timeline then
+    if not timeline.path then
+      add("    No file in the editor", "Comment")
+    elseif timeline.commits == nil then
+      add("    Loading history…", "Comment")
+    elseif #timeline.commits == 0 then
+      add("    No history for this file", "Comment")
+    else
+      for _, commit in ipairs(timeline.commits) do
+        add(
+          ("  %s %s"):format(commit.short_hash, truncate(commit.subject, math.max(width - 13, 10))),
+          nil,
+          commit
+        )
+      end
+      if not timeline.exhausted then
+        if timeline.loading then
+          add("    Loading more history…", "Comment", { kind = "timeline_load_more", loading = true })
+        else
+          add("  ↓ Load more history", "Function", { kind = "timeline_load_more" })
+        end
       end
     end
   end
@@ -515,6 +559,170 @@ function load_commits(state, opts)
   end)
 end
 
+-- One page of a file's history. `--follow` is what makes it a timeline rather
+-- than a log of a name: the file's story does not begin where its current path
+-- does, and `--name-status` gives each commit its own view of the path so the
+-- diff of a commit from before a rename can still be asked for.
+--
+-- It also rules out paging with `--skip`. Following a rename rewrites the path
+-- as the walk goes, and git answers a skipped `--follow` with nothing at all,
+-- so a longer page is re-read from the top instead. For the history of a single
+-- file that is a cheap thing to do.
+local TIMELINE_BATCH = 50
+
+local function parse_timeline(output, path)
+  local commits, current = {}, nil
+  for line in output:gmatch("[^\r\n]+") do
+    local hash, short, subject = line:match("^(%x+)\t(%x+)\t(.*)$")
+    if hash and #hash == 40 then
+      current = {
+        kind = "commit_file",
+        commit = hash,
+        short_hash = short,
+        subject = subject,
+        status = "M",
+        path = path,
+      }
+      commits[#commits + 1] = current
+    elseif current then
+      local status, first, second = line:match("^(%u%d*)\t([^\t]+)\t?(.*)$")
+      if status then
+        current.status = status:sub(1, 1)
+        if second ~= "" then
+          current.old_path, current.path = first, second
+        else
+          current.path = first
+        end
+      end
+    end
+  end
+  return commits
+end
+
+local function load_timeline(state, opts)
+  opts = opts or {}
+  local timeline = state.timeline
+  if not valid(state) or not timeline or not timeline.path then
+    return
+  end
+  local count = opts.count or (#(timeline.commits or {}) + TIMELINE_BATCH)
+  -- Once the whole history is on screen there is nothing left to grow into,
+  -- so only a refresh (`force`) re-reads it.
+  if timeline.loading or (timeline.exhausted and not opts.force) then
+    return
+  end
+  local path = timeline.path
+  timeline.loading = true
+  timeline.generation = timeline.generation + 1
+  local generation = timeline.generation
+  run_git(state.root, {
+    "-c",
+    "core.quotepath=false",
+    "log",
+    "--follow",
+    "--name-status",
+    "-M",
+    "--pretty=format:%H\t%h\t%s",
+    -- One past the page, so "a full page" and "the end of the history" can be
+    -- told apart the way the commit list does it.
+    ("-n%d"):format(count + 1),
+    "--",
+    path,
+  }, function(output)
+    if not valid(state) or timeline.generation ~= generation or timeline.path ~= path then
+      timeline.loading = false
+      return
+    end
+    local batch = parse_timeline(output, path)
+    timeline.exhausted = #batch <= count
+    batch[count + 1] = nil
+    timeline.commits = batch
+    timeline.offset = #batch
+    timeline.loading = false
+    render(state)
+  end)
+end
+
+-- The file the timeline follows is whatever the editor is showing. A panel, a
+-- terminal or a diff is not a file, and moving focus into one of them is no
+-- reason to throw the history away.
+local function buffer_repository_path(state, buf)
+  if not buf or not vim.api.nvim_buf_is_valid(buf) or vim.bo[buf].buftype ~= "" then
+    return
+  end
+  local name = vim.api.nvim_buf_get_name(buf)
+  if name == "" then
+    return
+  end
+  local full = vim.fs.normalize(vim.fn.fnamemodify(name, ":p"))
+  local root = (vim.fs.normalize(state.root or "")):gsub("/$", "")
+  if root == "" or full:sub(1, #root + 1) ~= root .. "/" then
+    return
+  end
+  return full:sub(#root + 2)
+end
+
+local function editor_file_path(state)
+  -- The focused buffer first, then any file the tab is showing: clicking into
+  -- the panel must not count as "no file open", and neither must a diff.
+  local path = buffer_repository_path(state, vim.api.nvim_get_current_buf())
+  if path then
+    return path
+  end
+  if not vim.api.nvim_win_is_valid(state.win) then
+    return
+  end
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(vim.api.nvim_win_get_tabpage(state.win))) do
+    path = buffer_repository_path(state, vim.api.nvim_win_get_buf(win))
+    if path then
+      return path
+    end
+  end
+end
+
+local function sync_timeline(state, opts)
+  if not valid(state) or not state.timeline then
+    return
+  end
+  local timeline = state.timeline
+  local path = editor_file_path(state)
+  local switched = path ~= nil and path ~= timeline.path
+  if switched then
+    timeline.path = path
+    timeline.commits = nil
+    timeline.offset = 0
+    timeline.exhausted = false
+    render(state)
+  elseif not timeline.path or not (opts and opts.reload) then
+    return
+  end
+  -- Keep as much history as was already on screen, so a list the reader grew
+  -- does not snap back to the first page behind a new commit.
+  load_timeline(state, { force = true, count = math.max(TIMELINE_BATCH, switched and 0 or timeline.offset) })
+end
+
+local timeline_tracking_set = false
+
+local function setup_timeline_tracking()
+  if timeline_tracking_set then
+    return
+  end
+  timeline_tracking_set = true
+  local group = vim.api.nvim_create_augroup("project_git_panel_timeline", { clear = true })
+  vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter" }, {
+    group = group,
+    callback = function()
+      for buf, state in pairs(states) do
+        if not valid(state) then
+          states[buf] = nil
+        else
+          sync_timeline(state)
+        end
+      end
+    end,
+  })
+end
+
 function M.refresh(buf, opts)
   local state = states[buf]
   if not valid(state) then
@@ -558,6 +766,7 @@ function M.refresh(buf, opts)
   local remembered = commit_depths[state.root]
   local depth = math.max(COMMIT_BATCH, state.commit_offset, remembered and remembered.offset or 0)
   load_commits(state, { count = depth, reset = true })
+  sync_timeline(state, { reload = true })
 end
 
 local function current_state()
@@ -1732,6 +1941,10 @@ local function action(state, focus_preview)
   elseif entry.kind == "commit_load_more" then
     if not entry.loading then
       load_commits(state)
+    end
+  elseif entry.kind == "timeline_load_more" then
+    if not entry.loading then
+      load_timeline(state)
     end
   elseif entry.kind == "commit" then
     if state.expanded[entry.full_hash] then
@@ -3025,7 +3238,9 @@ function M.open(explorer, root, attempt, open_opts)
     collapsed = {
       changes = false,
       commits = false,
+      timeline = false,
     },
+    timeline = { generation = 0, offset = 0 },
     expanded = {},
     commit_files = {},
     previews = {},
@@ -3041,7 +3256,9 @@ function M.open(explorer, root, attempt, open_opts)
   start_git_watcher(state)
   setup_context_menu()
   setup_global_mouse_mappings()
+  setup_timeline_tracking()
   sync_hover_events()
+  sync_timeline(state)
 
   local function map(lhs, rhs, desc)
     vim.keymap.set("n", lhs, rhs, { buffer = buf, silent = true, desc = desc })
@@ -3381,6 +3598,9 @@ M._activate_click = activate_click
 M._preview_button_hit = preview_button_hit
 M._hunk_actions = hunk_actions
 M._preview_context_entries = preview_context_entries
+M._parse_timeline = parse_timeline
+M._load_timeline = load_timeline
+M._sync_timeline = sync_timeline
 M._follow_active_row = follow_active_row
 
 return M
