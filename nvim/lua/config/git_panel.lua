@@ -281,7 +281,9 @@ local function render(state)
   end
 
   add("   " .. (state.branch or "Git"), "Title")
-  add("  click/↵ toggle or open", "NonText")
+  -- The buttons only appear on one row at a time, so the hint has to point at
+  -- the menu: it is the one place every action is always listed.
+  add("  click/↵ open · right-click menu", "NonText")
   add("")
 
   add_row({ kind = "section", section = "changes" })
