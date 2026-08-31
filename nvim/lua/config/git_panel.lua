@@ -1,4 +1,5 @@
 local ContextMenu = require("config.context_menu")
+local GitOps = require("config.git_ops")
 local PanelLayout = require("config.panel_layout")
 local TerminalTabs = require("config.terminal_tabs")
 
@@ -86,6 +87,144 @@ local function status_hl(status)
     or "Special"
 end
 
+-- The actions a row offers, in the order VSCode lays them out. Destructive
+-- first is deliberate: acting on a row changes which buttons it has, and the
+-- button that slides under a pointer already on its way down must never be the
+-- one that throws work away.
+local ROW_ACTIONS = {
+  { action = "discard", glyph = "↺", label = "Discard Changes", all = "Discard All Changes" },
+  { action = "unstage", glyph = "−", label = "Unstage Changes", all = "Unstage All Changes" },
+  { action = "stage", glyph = "+", label = "Stage Changes", all = "Stage All Changes" },
+}
+
+local function change_actions(changes)
+  local allowed = { stage = false, unstage = false, discard = false }
+  for _, change in ipairs(changes or {}) do
+    local actions = GitOps.file_actions(change.status)
+    allowed.stage = allowed.stage or actions.stage
+    allowed.unstage = allowed.unstage or actions.unstage
+    allowed.discard = allowed.discard or actions.discard
+  end
+  return allowed
+end
+
+-- What a row can do, and to how much. A section header acts on every change
+-- under it, except that it never offers to discard: a single click that throws
+-- away every uncommitted edit in the tree is not a button this panel grows.
+local function entry_actions(state, entry)
+  if not entry then
+    return nil
+  end
+  if entry.kind == "worktree_file" then
+    return GitOps.file_actions(entry.status), "file"
+  end
+  if entry.kind == "section" and entry.section == "changes" and (state.changes or {})[1] then
+    local allowed = change_actions(state.changes)
+    allowed.discard = false
+    return allowed, "all"
+  end
+end
+
+local function entry_buttons(state, entry)
+  local allowed, scope = entry_actions(state, entry)
+  local buttons = {}
+  for _, action in ipairs(allowed and ROW_ACTIONS or {}) do
+    if allowed[action.action] then
+      buttons[#buttons + 1] = {
+        action = action.action,
+        glyph = action.glyph,
+        label = scope == "all" and action.all or action.label,
+        scope = scope,
+      }
+    end
+  end
+  return buttons
+end
+
+local function section_text(state, section)
+  local arrow = state.collapsed[section] and "▸" or "▾"
+  if section == "changes" then
+    local label = state.changes == nil and "loading…" or tostring(#state.changes)
+    return ("  %s CHANGES  %s"):format(arrow, label)
+  end
+  local label = state.commits == nil and "loading…" or tostring(#state.commits)
+  return ("  %s COMMITS  %s"):format(arrow, label)
+end
+
+local function row_highlight(entry)
+  return entry.kind == "section" and "Function" or status_hl(entry.status)
+end
+
+local function pad_display(text, width)
+  local padding = width - vim.fn.strdisplaywidth(text)
+  return padding > 0 and text .. string.rep(" ", padding) or text
+end
+
+-- One row of the panel, with its action strip when it is the row that carries
+-- the buttons. The strip's byte ranges come back with it: a click reports a
+-- byte column, and nothing else can say which button it landed on.
+local function build_row(state, entry, width, with_buttons)
+  local buttons = with_buttons and entry_buttons(state, entry) or {}
+  local strip = ""
+  for _, button in ipairs(buttons) do
+    strip = strip .. " " .. button.glyph
+  end
+  local available = math.max(width - vim.fn.strdisplaywidth(strip), 1)
+
+  local text
+  if entry.kind == "section" then
+    text = section_text(state, entry.section)
+  else
+    local prefix = ("  %-2s "):format(entry.status)
+    text = prefix .. display_path(entry.path, math.max(available - vim.fn.strdisplaywidth(prefix), 1))
+  end
+  if #buttons == 0 then
+    return text, nil
+  end
+
+  text = pad_display(text, available)
+  local ranges, column = {}, #text
+  for _, button in ipairs(buttons) do
+    local piece = " " .. button.glyph
+    ranges[#ranges + 1] = {
+      from = column + 1,
+      to = column + #piece,
+      action = button.action,
+      label = button.label,
+      scope = button.scope,
+      entry = entry,
+    }
+    column = column + #piece
+  end
+  return text .. strip, ranges
+end
+
+-- Which row shows its buttons. VSCode reveals them under the pointer; a
+-- terminal reports pointer movement only where 'mousemoveevent' works, so the
+-- cursor row -- which every click, drag and keypress already moves -- stands in
+-- when it does not.
+local function active_row(state)
+  if state.hover_line then
+    return state.hover_line
+  end
+  if vim.api.nvim_win_is_valid(state.win) then
+    return vim.api.nvim_win_get_cursor(state.win)[1]
+  end
+end
+
+local function apply_button_highlights(state, line, ranges)
+  for _, range in ipairs(ranges or {}) do
+    local column = state.hover_line == line and state.hover_column or nil
+    local hovered = column ~= nil and column >= range.from and column <= range.to
+    vim.api.nvim_buf_set_extmark(state.buf, ns, line - 1, range.from - 1, {
+      end_col = range.to,
+      hl_group = hovered and "PmenuSel" or "Special",
+      -- Above the row's own colour, which spans the whole line.
+      priority = 200,
+    })
+  end
+end
+
 local function render(state)
   if not valid(state) then
     return
@@ -93,7 +232,8 @@ local function render(state)
 
   local width = vim.api.nvim_win_get_width(state.win)
   local cursor = vim.api.nvim_win_get_cursor(state.win)
-  local lines, entries, highlights = {}, {}, {}
+  local active = active_row(state)
+  local lines, entries, highlights, buttons = {}, {}, {}, {}
 
   local function add(text, highlight, entry)
     lines[#lines + 1] = text
@@ -105,38 +245,33 @@ local function render(state)
     end
   end
 
+  -- Rows that carry actions go through build_row(), so redrawing one row on
+  -- its own produces exactly the text a full render would have given it.
+  local function add_row(entry)
+    local text, ranges = build_row(state, entry, width, #lines + 1 == active)
+    add(text, row_highlight(entry), entry)
+    if ranges then
+      buttons[#lines] = ranges
+    end
+  end
+
   add("   " .. (state.branch or "Git"), "Title")
   add("  click/↵ toggle or open", "NonText")
   add("")
 
-  local changes_label = state.changes == nil and "loading…" or tostring(#state.changes)
-  add(
-    ("  %s CHANGES  %s"):format(state.collapsed.changes and "▸" or "▾", changes_label),
-    "Function",
-    { kind = "section", section = "changes" }
-  )
+  add_row({ kind = "section", section = "changes" })
   if not state.collapsed.changes and state.changes ~= nil then
     if #state.changes == 0 then
       add("    ✓ Working tree clean", "DiagnosticOk")
     else
       for _, item in ipairs(state.changes) do
-        local prefix = ("  %-2s "):format(item.status)
-        add(
-          prefix .. display_path(item.path, math.max(width - vim.fn.strdisplaywidth(prefix), 1)),
-          status_hl(item.status),
-          item
-        )
+        add_row(item)
       end
     end
   end
 
   add("")
-  local commits_label = state.commits == nil and "loading…" or tostring(#state.commits)
-  add(
-    ("  %s COMMITS  %s"):format(state.collapsed.commits and "▸" or "▾", commits_label),
-    "Function",
-    { kind = "section", section = "commits" }
-  )
+  add_row({ kind = "section", section = "commits" })
   if not state.collapsed.commits and state.commits ~= nil then
     if #state.commits == 0 then
       add("    No commits", "Comment")
@@ -186,6 +321,8 @@ local function render(state)
   end
 
   state.entries = entries
+  state.buttons = buttons
+  state.active_line = active
   -- Appending a batch leaves every earlier line untouched, so replace only the
   -- tail that actually changed. Rewriting the whole buffer costs seconds once
   -- the list is thousands of lines long, and it scrolls the viewport away from
@@ -214,6 +351,11 @@ local function render(state)
     end
     local _ = index
   end
+  for line, ranges in pairs(buttons) do
+    if line - 1 >= shared then
+      apply_button_highlights(state, line, ranges)
+    end
+  end
   state.rendered_lines = lines
   vim.bo[state.buf].modifiable = false
   pcall(vim.api.nvim_win_set_cursor, state.win, { math.min(cursor[1], #lines), 0 })
@@ -224,6 +366,47 @@ local function render(state)
       vim.fn.winrestview(view)
     end)
   end
+end
+
+-- Redraw one row in place. Moving the action strip touches only the row the
+-- pointer left and the one it entered, and a full render rewrites every line
+-- of a list that can be thousands of commits long -- far too much work to do
+-- on a mouse movement.
+local function render_row(state, line)
+  if not valid(state) or not line or not state.rendered_lines then
+    return
+  end
+  local entry = state.entries and state.entries[line]
+  if not entry or not entry_actions(state, entry) then
+    return
+  end
+  local text, ranges = build_row(state, entry, vim.api.nvim_win_get_width(state.win), line == active_row(state))
+  state.buttons = state.buttons or {}
+  state.buttons[line] = ranges
+  if state.rendered_lines[line] ~= text then
+    vim.bo[state.buf].modifiable = true
+    vim.api.nvim_buf_set_lines(state.buf, line - 1, line, false, { text })
+    vim.bo[state.buf].modifiable = false
+    state.rendered_lines[line] = text
+  end
+  vim.api.nvim_buf_clear_namespace(state.buf, ns, line - 1, line)
+  vim.api.nvim_buf_add_highlight(state.buf, ns, row_highlight(entry), line - 1, 0, -1)
+  apply_button_highlights(state, line, ranges)
+end
+
+-- Hand the action strip to whichever row is active now.
+local function follow_active_row(state)
+  if not valid(state) then
+    return
+  end
+  local current = active_row(state)
+  if state.active_line == current then
+    return
+  end
+  local previous = state.active_line
+  state.active_line = current
+  render_row(state, previous)
+  render_row(state, current)
 end
 
 local function parse_status(output)
@@ -1468,6 +1651,200 @@ local function position_panel_mouse(state, mouse)
   return true
 end
 
+-- ── acting on a change ──────────────────────────────────────────────────
+
+local function notify_error(message)
+  if rawget(_G, "Snacks") and Snacks.notify then
+    Snacks.notify.error(message)
+  else
+    vim.notify(message, vim.log.levels.ERROR)
+  end
+end
+
+-- The paths to hand git. A rename is two entries in the index, so taking one
+-- back out has to name both or the old path stays deleted there.
+local function action_paths(action, changes)
+  local paths = {}
+  for _, change in ipairs(changes) do
+    paths[#paths + 1] = change.path
+    if action == "unstage" and change.old_path then
+      paths[#paths + 1] = change.old_path
+    end
+  end
+  return paths
+end
+
+-- What a row's action applies to. A section header covers every change the
+-- action is actually possible for: handing git a path it cannot stage or
+-- unstage turns the whole batch into an error.
+local function changes_for(state, entry, scope, action)
+  if scope ~= "all" then
+    return { entry }
+  end
+  local changes = {}
+  for _, change in ipairs(state.changes or {}) do
+    if GitOps.file_actions(change.status)[action] then
+      changes[#changes + 1] = change
+    end
+  end
+  return changes
+end
+
+local function run_change_action(state, action, changes)
+  local buf = state.buf
+  local function finished(err)
+    if err then
+      notify_error(err)
+    end
+    -- Restoring a file touches only the working tree, and the panel's watcher
+    -- only ever sees `.git`, so nothing else would bring the list back in step.
+    M.refresh(buf, { status_only = true })
+  end
+  if action == "stage" then
+    GitOps.stage(state.root, action_paths(action, changes), finished)
+  elseif action == "unstage" then
+    GitOps.unstage(state.root, action_paths(action, changes), finished)
+  elseif action == "discard" then
+    GitOps.discard(state.root, changes, finished)
+  end
+end
+
+local function cursor_mouse(state)
+  local line = vim.api.nvim_win_get_cursor(state.win)[1]
+  local position = vim.fn.screenpos(state.win, line, 1)
+  return {
+    screenrow = position.row > 0 and position.row or 1,
+    screencol = position.col > 0 and position.col or 1,
+  }
+end
+
+-- Discarding is the one action here that destroys work no git command can
+-- bring back, so it asks first -- and says what exactly will be lost, because
+-- "discard 12 files" and "delete a file git has never seen" are not the same
+-- warning.
+local function confirm_discard(state, changes, mouse, proceed)
+  local deletions = 0
+  for _, change in ipairs(changes) do
+    if change.status == "??" then
+      deletions = deletions + 1
+    end
+  end
+  local subject = #changes == 1 and ("`%s`"):format(changes[1].path) or ("%d files"):format(#changes)
+  local prompt = ("Discard changes in %s?"):format(subject)
+  if deletions > 0 then
+    prompt = ("Discard %s? %d untracked file(s) will be deleted."):format(subject, deletions)
+  end
+  ContextMenu.open({
+    { label = prompt, enabled = false },
+    { separator = true },
+    { label = "Discard Changes", action = proceed },
+    { label = "Cancel", action = function() end },
+  }, mouse or cursor_mouse(state), {
+    filetype = "git_panel_confirm",
+    min_width = math.min(vim.api.nvim_strwidth(prompt) + 4, math.max(vim.o.columns - 4, 20)),
+  })
+end
+
+local function activate_action(state, action, entry, scope, mouse)
+  local changes = changes_for(state, entry, scope, action)
+  if #changes == 0 then
+    return
+  end
+  if action ~= "discard" then
+    return run_change_action(state, action, changes)
+  end
+  confirm_discard(state, changes, mouse, function()
+    run_change_action(state, action, changes)
+  end)
+end
+
+local function button_at(state, mouse)
+  local ranges = state.buttons and mouse and state.buttons[mouse.line]
+  if not ranges or not mouse_hits_panel_line(state, mouse) then
+    return
+  end
+  for _, range in ipairs(ranges) do
+    if mouse.column >= range.from and mouse.column <= range.to then
+      return range
+    end
+  end
+end
+
+-- A click inside the panel: the button it landed on, or the row's own action.
+-- Only one of the two ever runs, or staging a file would also open its diff.
+local function activate_click(state, mouse)
+  local range = button_at(state, mouse)
+  if not range then
+    return action(state, false)
+  end
+  activate_action(state, range.action, range.entry, range.scope, mouse)
+end
+
+-- ── the hovered row ─────────────────────────────────────────────────────
+
+local function panel_at_window(win)
+  for buf, state in pairs(states) do
+    if not valid(state) then
+      states[buf] = nil
+    elseif win and state.win == win then
+      return state
+    end
+  end
+end
+
+local function set_hover(state, line, column)
+  state.hover_line, state.hover_column = line, column
+  follow_active_row(state)
+  -- Which button is lit changes with the column alone, without the row moving.
+  if line and state.active_line == line then
+    render_row(state, line)
+  end
+end
+
+function M._handle_mouse_move(mouse)
+  local target = panel_at_window(mouse and mouse.winid)
+  for buf, state in pairs(states) do
+    if not valid(state) then
+      states[buf] = nil
+    elseif state ~= target and state.hover_line then
+      set_hover(state, nil, nil)
+    end
+  end
+  if not target then
+    return false
+  end
+  local line = mouse_hits_panel_line(target, mouse) and mouse.line or nil
+  local column = line and mouse.column or nil
+  if target.hover_line == line and target.hover_column == column then
+    return false
+  end
+  set_hover(target, line, column)
+  return true
+end
+
+-- 'mousemoveevent' is global and makes the terminal report every pointer
+-- movement, so it is switched on only while a panel is on screen and put back
+-- exactly as it was once the last one is gone.
+local hover_events_original
+
+local function sync_hover_events()
+  local wanted = false
+  for buf, state in pairs(states) do
+    if valid(state) then
+      wanted = true
+    else
+      states[buf] = nil
+    end
+  end
+  if wanted and hover_events_original == nil then
+    hover_events_original = vim.o.mousemoveevent
+    vim.o.mousemoveevent = true
+  elseif not wanted and hover_events_original ~= nil then
+    vim.o.mousemoveevent = hover_events_original
+    hover_events_original = nil
+  end
+end
+
 local function workspace_path(state, entry)
   if not (state and state.root and entry and entry.path) then
     return
@@ -1518,16 +1895,58 @@ local function open_workspace_file(state, entry)
   return true
 end
 
-local function workspace_context_entries(state, entry)
-  return {
-    {
+-- The right-click menu names the same actions the row's buttons offer, plus
+-- the two ways to open what the row points at. Everything a row cannot do is
+-- listed and greyed rather than hidden, so the menu does not change shape
+-- between one file and the next.
+local function action_spec(name)
+  for _, spec in ipairs(ROW_ACTIONS) do
+    if spec.action == name then
+      return spec
+    end
+  end
+end
+
+local function workspace_context_entries(state, entry, mouse)
+  local entries = {}
+  if entry.kind ~= "section" then
+    if entry.kind == "worktree_file" then
+      entries[#entries + 1] = {
+        label = "Open Changes",
+        action = function()
+          open_file_preview(state, entry, true)
+        end,
+      }
+    end
+    entries[#entries + 1] = {
       label = "Open File",
       enabled = workspace_file_exists(workspace_path(state, entry)),
       action = function()
         open_workspace_file(state, entry)
       end,
-    },
-  }
+    }
+  end
+
+  local allowed, scope = entry_actions(state, entry)
+  if allowed then
+    if #entries > 0 then
+      entries[#entries + 1] = { separator = true }
+    end
+    for _, name in ipairs({ "stage", "unstage", "discard" }) do
+      -- A section never offers to discard, so it does not list it either.
+      if not (scope == "all" and name == "discard") then
+        local spec = action_spec(name)
+        entries[#entries + 1] = {
+          label = scope == "all" and spec.all or spec.label,
+          enabled = allowed[name] == true,
+          action = function()
+            activate_action(state, name, entry, scope, mouse)
+          end,
+        }
+      end
+    end
+  end
+  return entries
 end
 
 local function context_entry_at_mouse(state, mouse)
@@ -1536,6 +1955,9 @@ local function context_entry_at_mouse(state, mouse)
   end
   local entry = state.entries[mouse.line]
   if entry and (entry.kind == "worktree_file" or entry.kind == "commit_file") then
+    return entry
+  end
+  if entry and entry.kind == "section" and entry_actions(state, entry) then
     return entry
   end
 end
@@ -1557,7 +1979,7 @@ local function setup_context_menu()
         if entry then
           vim.schedule(function()
             if valid(state) and position_panel_mouse(state, mouse) then
-              ContextMenu.open(workspace_context_entries(state, entry), mouse, {
+              ContextMenu.open(workspace_context_entries(state, entry, mouse), mouse, {
                 filetype = "git_panel_context_menu",
               })
             end
@@ -1585,7 +2007,7 @@ local function setup_global_mouse_mappings()
       if state then
         vim.schedule(function()
           if position_panel_mouse(state, mouse) then
-            action(state, false)
+            activate_click(state, mouse)
           end
         end)
         return ""
@@ -1615,6 +2037,18 @@ local function setup_global_mouse_mappings()
       return key
     end, { expr = true, silent = true, desc = "Toggle or open Git panel item" })
   end
+  -- VSCode reveals a row's actions when the pointer is over it. In a terminal
+  -- that needs 'mousemoveevent', which the panel switches on for as long as it
+  -- is on screen. Never swallow the key: other hover features want it too.
+  vim.keymap.set({ "n", "x", "i", "t" }, "<MouseMove>", function()
+    -- An <expr> mapping runs under textlock, where redrawing a row is illegal.
+    local mouse = vim.fn.getmousepos()
+    vim.schedule(function()
+      M._handle_mouse_move(mouse)
+    end)
+    return "<MouseMove>"
+  end, { expr = true, silent = true, desc = "Track the Git panel's hovered row" })
+
   vim.keymap.set({ "n", "x", "i" }, "<LeftDrag>", function()
     local state, mouse = mouse_panel_target()
     if state then
@@ -1694,6 +2128,7 @@ function M.detach(state)
   close_preview(state)
   local win, buf = state.win, state.buf
   states[buf] = nil
+  sync_hover_events()
   if vim.api.nvim_win_is_valid(win) then
     local scratch = vim.api.nvim_create_buf(false, true)
     vim.bo[scratch].bufhidden = "wipe"
@@ -2253,6 +2688,7 @@ function M.open(explorer, root, attempt, open_opts)
   start_git_watcher(state)
   setup_context_menu()
   setup_global_mouse_mappings()
+  sync_hover_events()
 
   local function map(lhs, rhs, desc)
     vim.keymap.set("n", lhs, rhs, { buffer = buf, silent = true, desc = desc })
@@ -2260,6 +2696,32 @@ function M.open(explorer, root, attempt, open_opts)
   map("<CR>", function()
     action(state, true)
   end, "Expand commit or preview file")
+  -- The buttons and the right-click menu are the mouse's way in; these are the
+  -- same three actions for a keyboard, on the row under the cursor.
+  for _, item in ipairs({
+    { key = "a", action = "stage", desc = "Stage the change under the cursor" },
+    { key = "u", action = "unstage", desc = "Unstage the change under the cursor" },
+    { key = "x", action = "discard", desc = "Discard the change under the cursor" },
+  }) do
+    map(item.key, function()
+      local entry = state.entries[vim.api.nvim_win_get_cursor(state.win)[1]]
+      local allowed, scope = entry_actions(state, entry)
+      if allowed and allowed[item.action] then
+        activate_action(state, item.action, entry, scope)
+      end
+    end, item.desc)
+  end
+
+  -- Where the terminal reports no pointer movement the cursor row is the one
+  -- that shows its buttons, so it has to follow the cursor -- including j/k.
+  vim.api.nvim_create_autocmd({ "CursorMoved", "WinEnter" }, {
+    buffer = buf,
+    callback = function()
+      if valid(state) and not state.hover_line then
+        follow_active_row(state)
+      end
+    end,
+  })
   local function panel_mouse()
     local mouse = vim.fn.getmousepos()
     if mouse_in_panel_content(state, mouse) then
@@ -2284,7 +2746,7 @@ function M.open(explorer, root, attempt, open_opts)
         -- soon as the current input event has finished instead.
         vim.schedule(function()
           if position_mouse(mouse) then
-            action(state, false)
+            activate_click(state, mouse)
           end
         end)
         return ""
@@ -2349,6 +2811,7 @@ function M.open(explorer, root, attempt, open_opts)
       close_preview(state)
       stop_git_watcher(state)
       states[buf] = nil
+      sync_hover_events()
       vim.schedule(function()
         if explorer and explorer.layout and explorer.layout:valid() then
           explorer.layout:update()
@@ -2560,5 +3023,8 @@ M._workspace_path = workspace_path
 M._workspace_context_entries = workspace_context_entries
 M._open_workspace_file = open_workspace_file
 M._context_entry_at_mouse = context_entry_at_mouse
+M._entry_buttons = entry_buttons
+M._activate_click = activate_click
+M._follow_active_row = follow_active_row
 
 return M

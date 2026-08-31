@@ -205,6 +205,20 @@ local function check_git_panel()
     vim.health.ok(("%d .git watcher(s) running"):format(watching))
   end
 
+  -- A row reveals its actions under the pointer only while Neovim asks the
+  -- terminal to report movement. Without it the panel still works, from the
+  -- cursor row and the right-click menu, but the buttons stop following the
+  -- mouse -- which looks like they are gone.
+  if count(states) > 0 then
+    if vim.o.mousemoveevent then
+      vim.health.ok("pointer tracking is on: row actions follow the mouse")
+    else
+      vim.health.warn("'mousemoveevent' is off: row actions only follow the cursor", {
+        "The panel turns it on while it is open, so something else turned it back off.",
+      })
+    end
+  end
+
   local depths = panel._commit_depths or {}
   if count(depths) > 0 then
     local parts = {}

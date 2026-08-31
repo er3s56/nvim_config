@@ -6,6 +6,16 @@ local function assert_equal(expected, actual, message)
   end
 end
 
+-- The menu grew actions, so nothing may depend on an entry's position in it.
+local function menu_entry(entries, label)
+  for _, entry in ipairs(entries) do
+    if entry.label == label then
+      return entry
+    end
+  end
+  error(("the context menu has no `%s` entry"):format(label))
+end
+
 local short_path = "src/config/file.lua"
 assert_equal(short_path, GitPanel._display_path(short_path, 40), "short Git path was changed")
 
@@ -57,15 +67,39 @@ local renamed = {
 }
 local state = { root = root, buf = panel_buf, win = panel_win, entries = {} }
 assert_equal(absolute, GitPanel._workspace_path(state, renamed), "renamed entry did not resolve its new path")
-assert(GitPanel._workspace_context_entries(state, renamed)[1].enabled, "existing workspace file was disabled")
+local renamed_menu = GitPanel._workspace_context_entries(state, renamed)
+assert(menu_entry(renamed_menu, "Open File").enabled, "existing workspace file was disabled")
+-- A staged rename has nothing left in the working tree to stage or discard.
+assert(menu_entry(renamed_menu, "Unstage Changes").enabled, "a staged rename could not be unstaged")
+assert(not menu_entry(renamed_menu, "Stage Changes").enabled, "a staged rename offered to stage again")
+assert(not menu_entry(renamed_menu, "Discard Changes").enabled, "a staged rename offered to discard nothing")
+
+local unstaged = { kind = "worktree_file", status = " M", path = renamed_path }
+local unstaged_menu = GitPanel._workspace_context_entries(state, unstaged)
+assert(menu_entry(unstaged_menu, "Open Changes"), "a change row cannot open its diff from the menu")
+assert(menu_entry(unstaged_menu, "Stage Changes").enabled, "an unstaged change could not be staged")
+assert(menu_entry(unstaged_menu, "Discard Changes").enabled, "an unstaged change could not be discarded")
+assert(not menu_entry(unstaged_menu, "Unstage Changes").enabled, "an unstaged change offered to unstage")
+
+-- The CHANGES header acts on every change under it, but never offers to throw
+-- all of them away.
+local section = { kind = "section", section = "changes" }
+local section_state = { root = root, buf = panel_buf, win = panel_win, entries = {}, changes = { unstaged } }
+local section_menu = GitPanel._workspace_context_entries(section_state, section)
+assert(menu_entry(section_menu, "Stage All Changes").enabled, "the section could not stage everything")
+for _, entry in ipairs(section_menu) do
+  assert(entry.label ~= "Discard All Changes", "the section offered to discard every change at once")
+end
+assert(#GitPanel._workspace_context_entries({ changes = {} }, section) == 0, "an empty section offered actions")
 
 local historical = { kind = "commit_file", status = "M", path = renamed_path }
 assert(
-  GitPanel._workspace_context_entries(state, historical)[1].enabled,
+  menu_entry(GitPanel._workspace_context_entries(state, historical), "Open File").enabled,
   "historical entry with a current workspace file was disabled"
 )
 local deleted = { kind = "worktree_file", status = "D ", path = "removed.txt" }
-assert(not GitPanel._workspace_context_entries(state, deleted)[1].enabled, "deleted workspace file was enabled")
+local deleted_menu = GitPanel._workspace_context_entries(state, deleted)
+assert(not menu_entry(deleted_menu, "Open File").enabled, "deleted workspace file was enabled")
 
 vim.bo[panel_buf].modifiable = true
 vim.api.nvim_buf_set_lines(panel_buf, 0, -1, false, { "file", "section", "commit", "padding" })
@@ -95,10 +129,10 @@ end
 vim.notify = function() end
 
 local ok, test_error = pcall(function()
-  local menu_entry = GitPanel._workspace_context_entries(state, renamed)[1]
-  assert(menu_entry.enabled, "existing file was disabled before the race test")
+  local open_file = menu_entry(GitPanel._workspace_context_entries(state, renamed), "Open File")
+  assert(open_file.enabled, "existing file was disabled before the race test")
   assert(vim.fn.delete(absolute) == 0)
-  menu_entry.action()
+  open_file.action()
   assert_equal(0, #opened, "file removed after menu creation was still opened")
 
   assert(vim.fn.writefile({ "workspace" }, absolute) == 0)

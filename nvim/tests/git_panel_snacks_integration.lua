@@ -117,7 +117,10 @@ local ok, test_error = pcall(function()
     "Git file context menu did not open"
   )
   assert(vim.api.nvim_win_get_cursor(state.win)[1] == row, "Git right click did not position the panel cursor")
-  assert(vim.api.nvim_buf_get_lines(0, 0, 1, false)[1]:find("Open File", 1, true), "Git menu action is missing")
+  local menu = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), "\n")
+  for _, label in ipairs({ "Open Changes", "Open File", "Stage Changes", "Discard Changes" }) do
+    assert(menu:find(label, 1, true), ("the Git menu is missing `%s`"):format(label))
+  end
   ContextMenu.close()
 
   vim.api.nvim_set_current_win(state.win)
