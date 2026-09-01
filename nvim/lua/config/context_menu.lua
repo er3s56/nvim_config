@@ -5,7 +5,6 @@ local handlers = {}
 local handler_order = {}
 local setup_done = false
 local disabled_namespace = vim.api.nvim_create_namespace("project_context_menu_disabled")
-
 local function report_handler_error(name, err)
   vim.schedule(function()
     local message = ("Context menu handler `%s` failed: %s"):format(name, tostring(err))
@@ -26,6 +25,34 @@ function M.close()
   if menu and menu.buf and vim.api.nvim_buf_is_valid(menu.buf) then
     vim.api.nvim_buf_delete(menu.buf, { force = true })
   end
+end
+
+-- Whether a click lands outside the open menu, and closing it if it does.
+--
+-- The menu's own dismissal is buffer-local, so it only ever gets a say while
+-- the menu window has focus. Every panel in this configuration also maps
+-- <LeftMouse> globally and swallows presses over itself, so a press meant to
+-- dismiss the menu could be consumed before the menu heard about it and the
+-- menu would stay on screen. Those handlers ask here first instead.
+--
+-- The press that dismisses a menu does nothing else -- it does not also act on
+-- what it landed on -- which is how menus behave everywhere else.
+function M.dismiss(mouse)
+  local menu = active_menu
+  if not menu or not menu.win or not vim.api.nvim_win_is_valid(menu.win) then
+    return false
+  end
+  if mouse and mouse.winid == menu.win then
+    return false
+  end
+  vim.schedule(function()
+    -- Only this menu: a handler further along the chain may have opened
+    -- another one in the meantime, and that one is not ours to close.
+    if active_menu == menu then
+      M.close()
+    end
+  end)
+  return true
 end
 
 function M.open(entries, mouse, opts)
@@ -130,14 +157,29 @@ function M.open(entries, mouse, opts)
     activate()
   end)
   map_many({ "q", "<Esc>" }, M.close)
-  map_many({ "<LeftMouse>", "<RightMouse>" }, function()
+  -- The right button only ever dismisses. Pressing it repeatedly is how this
+  -- menu gets closed by hand, and a second press landing on an entry must not
+  -- run it -- least of all one that discards work.
+  map_many({ "<RightMouse>", "<2-RightMouse>", "<3-RightMouse>", "<4-RightMouse>" }, function()
+    vim.schedule(M.close)
+    return ""
+  end, vim.tbl_extend("force", map_opts, { expr = true }))
+  map_many({ "<LeftMouse>" }, function()
     local position = vim.fn.getmousepos()
     if position.winid == win and position.line >= 1 and position.line <= #entries then
       vim.schedule(function()
-        if active_menu and active_menu.win == win and vim.api.nvim_win_is_valid(win) then
-          vim.api.nvim_win_set_cursor(win, { position.line, 0 })
-          activate(position.line)
+        if not (active_menu and active_menu.win == win and vim.api.nvim_win_is_valid(win)) then
+          return
         end
+        -- A press on a row that cannot be chosen -- a separator, a heading, an
+        -- action this row cannot perform -- closes the menu like a press
+        -- outside it. Half of a menu can be greyed out, and a menu that
+        -- silently ignores presses reads as one that cannot be dismissed.
+        if not selectable(position.line) then
+          return M.close()
+        end
+        vim.api.nvim_win_set_cursor(win, { position.line, 0 })
+        activate(position.line)
       end)
     else
       vim.schedule(M.close)
@@ -175,6 +217,10 @@ function M.setup()
   setup_done = true
   vim.keymap.set({ "n", "x", "i", "t" }, "<RightMouse>", function()
     local mouse = vim.fn.getmousepos()
+    -- A right click elsewhere replaces the menu rather than stacking a second
+    -- one on it, and closes it outright where nothing offers a menu. It is not
+    -- swallowed: the handlers below still get to open the replacement.
+    M.dismiss(mouse)
     for _, name in ipairs(handler_order) do
       local ok, handled = pcall(handlers[name], mouse)
       if not ok then

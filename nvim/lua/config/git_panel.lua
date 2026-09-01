@@ -2653,6 +2653,12 @@ local function setup_global_mouse_mappings()
     local key = lhs
     vim.keymap.set({ "n", "x", "i" }, key, function()
       local state, mouse = mouse_panel_target()
+      -- A press outside an open menu dismisses it and does nothing else. This
+      -- has to come first: everything below swallows presses over a panel, and
+      -- a swallowed press would leave the menu on screen.
+      if ContextMenu.dismiss(mouse) then
+        return ""
+      end
       if state then
         vim.schedule(function()
           if position_panel_mouse(state, mouse) then
@@ -3401,6 +3407,9 @@ function M.open(explorer, root, attempt, open_opts)
     local key = lhs
     vim.keymap.set({ "n", "x" }, key, function()
       local mouse = vim.fn.getmousepos()
+      if ContextMenu.dismiss(mouse) then
+        return ""
+      end
       if mouse_in_panel_content(state, mouse) then
         -- An <expr> mapping runs under textlock. Moving the cursor/window here
         -- is illegal on some Neovim versions, so do the panel-local part as

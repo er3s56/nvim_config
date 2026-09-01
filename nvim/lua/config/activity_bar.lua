@@ -1,3 +1,4 @@
+local ContextMenu = require("config.context_menu")
 local PanelLayout = require("config.panel_layout")
 local TerminalTabs = require("config.terminal_tabs")
 
@@ -1569,6 +1570,12 @@ function M.setup()
 
   vim.keymap.set({ "n", "x", "i", "t" }, "<LeftMouse>", function()
     local mouse = vim.fn.getmousepos()
+    -- A press outside an open menu dismisses it and does nothing else. This
+    -- has to come first: the handlers below swallow presses over their own
+    -- panels, and a swallowed press would leave the menu on screen.
+    if ContextMenu.dismiss(mouse) then
+      return ""
+    end
     if M._handle_mouse(mouse) then
       return ""
     end
