@@ -2576,6 +2576,69 @@ local function workspace_context_entries(state, entry, mouse)
   return entries
 end
 
+local function set_all_collapsed(state, collapsed)
+  for _, section in ipairs({ "changes", "commits", "timeline" }) do
+    state.collapsed[section] = collapsed
+  end
+  render(state)
+end
+
+-- Rows with no actions of their own -- a commit, a heading, the empty space
+-- below the list -- still answer a right click, with what can be done to the
+-- panel itself. A right click that does nothing reads as broken, and Neovim's
+-- built-in PopUp menu is not an acceptable stand-in for it.
+local function panel_context_entries(state, mouse)
+  local entries = {}
+  local row = mouse_hits_panel_line(state, mouse) and state.entries[mouse.line] or nil
+  if row and row.kind == "commit" then
+    entries[#entries + 1] = {
+      label = "Copy Commit Hash",
+      action = function()
+        vim.fn.setreg('"', row.full_hash)
+        pcall(vim.fn.setreg, "+", row.full_hash)
+      end,
+    }
+    entries[#entries + 1] = { separator = true }
+  end
+
+  local allowed = change_actions(state.changes)
+  entries[#entries + 1] = {
+    label = "Stage All Changes",
+    enabled = allowed.stage,
+    action = function()
+      activate_action(state, "stage", nil, "all", mouse)
+    end,
+  }
+  entries[#entries + 1] = {
+    label = "Unstage All Changes",
+    enabled = allowed.unstage,
+    action = function()
+      activate_action(state, "unstage", nil, "all", mouse)
+    end,
+  }
+  entries[#entries + 1] = { separator = true }
+  entries[#entries + 1] = {
+    label = "Collapse All Sections",
+    action = function()
+      set_all_collapsed(state, true)
+    end,
+  }
+  entries[#entries + 1] = {
+    label = "Expand All Sections",
+    action = function()
+      set_all_collapsed(state, false)
+    end,
+  }
+  entries[#entries + 1] = { separator = true }
+  entries[#entries + 1] = {
+    label = "Refresh",
+    action = function()
+      M.refresh(state.buf)
+    end,
+  }
+  return entries
+end
+
 local function context_entry_at_mouse(state, mouse)
   if not mouse_hits_panel_line(state, mouse) then
     return
@@ -2601,18 +2664,20 @@ local function setup_context_menu()
     for buf, state in pairs(states) do
       if not valid(state) then
         states[buf] = nil
-      else
+      elseif mouse_in_panel_content(state, mouse) then
         local entry = context_entry_at_mouse(state, mouse)
-        if entry then
-          vim.schedule(function()
-            if valid(state) and position_panel_mouse(state, mouse) then
-              ContextMenu.open(workspace_context_entries(state, entry, mouse), mouse, {
-                filetype = "git_panel_context_menu",
-              })
-            end
-          end)
-          return true
-        end
+        vim.schedule(function()
+          if not valid(state) then
+            return
+          end
+          -- Below the last line there is no row to put the cursor on, which is
+          -- not a reason to withhold the panel's own menu.
+          position_panel_mouse(state, mouse)
+          local entries = entry and workspace_context_entries(state, entry, mouse)
+            or panel_context_entries(state, mouse)
+          ContextMenu.open(entries, mouse, { filetype = "git_panel_context_menu" })
+        end)
+        return true
       end
     end
   end)

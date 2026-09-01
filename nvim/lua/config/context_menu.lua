@@ -215,27 +215,50 @@ function M.setup()
     return
   end
   setup_done = true
-  vim.keymap.set({ "n", "x", "i", "t" }, "<RightMouse>", function()
-    local mouse = vim.fn.getmousepos()
-    -- A right click elsewhere replaces the menu rather than stacking a second
-    -- one on it, and closes it outright where nothing offers a menu. It is not
-    -- swallowed: the handlers below still get to open the replacement.
-    M.dismiss(mouse)
-    for _, name in ipairs(handler_order) do
-      local ok, handled = pcall(handlers[name], mouse)
-      if not ok then
-        report_handler_error(name, handled)
-      elseif handled then
+  for _, lhs in ipairs({ "<RightMouse>", "<2-RightMouse>", "<3-RightMouse>", "<4-RightMouse>" }) do
+    local key = lhs
+    vim.keymap.set({ "n", "x", "i", "t" }, key, function()
+      local mouse = vim.fn.getmousepos()
+      -- A right click elsewhere replaces the menu rather than stacking a second
+      -- one on it, and closes it outright where nothing offers a menu. It is
+      -- not swallowed: the handlers below still get to open the replacement.
+      M.dismiss(mouse)
+      -- Never hand a click on the menu back to Neovim. Pressing the right
+      -- button twice in a row arrives as <2-RightMouse>, which the menu's own
+      -- buffer-local mapping does not cover, and the built-in PopUp would open
+      -- on top of the menu that is already there.
+      if active_menu and active_menu.win == mouse.winid then
         return ""
       end
-    end
-    return "<RightMouse>"
-  end, {
-    expr = true,
-    replace_keycodes = true,
-    silent = true,
-    desc = "Open project context menu",
-  })
+      for _, name in ipairs(handler_order) do
+        local ok, handled = pcall(handlers[name], mouse)
+        if not ok then
+          report_handler_error(name, handled)
+        elseif handled then
+          return ""
+        end
+      end
+      -- Nothing here has a menu to offer. Handing the click back to Neovim
+      -- over a panel opens the built-in PopUp menu -- 'mousemodel' is
+      -- popup_setpos by default -- which offers Inspect, Paste and Select All
+      -- for a panel that cannot be edited, and only closes on a selection or
+      -- <Esc>. A panel row without a menu of its own has no menu at all.
+      local activity = package.loaded["config.activity_bar"]
+      if activity and activity._over_panel and activity._over_panel(mouse) then
+        return ""
+      end
+      local scrollbar = package.loaded["config.picker_scrollbar"]
+      if scrollbar and scrollbar._over_terminal and scrollbar._over_terminal(mouse) then
+        return ""
+      end
+      return key
+    end, {
+      expr = true,
+      replace_keycodes = true,
+      silent = true,
+      desc = "Open project context menu",
+    })
+  end
 end
 
 M._handlers = handlers

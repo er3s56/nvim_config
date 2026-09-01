@@ -214,6 +214,57 @@ local ok, test_error = pcall(function()
     return (panel.changes[1] or {}).status ~= before_status
   end, "a press on `Stage Changes` closed the menu without staging anything")
 
+  -- ── a right click with no menu behind it ──────────────────────────────
+  -- 'mousemodel' is popup_setpos by default, so a right click Neovim is left
+  -- to handle opens its built-in PopUp menu: Inspect, Paste, Select All, over
+  -- a panel that cannot be edited, closing only on a selection or <Esc>. Rows
+  -- without a menu of their own must therefore have no menu at all.
+  ContextMenu.close()
+  vim.wait(100)
+  local right_click = assert(global_mapping("<RightMouse>"), "no global <RightMouse> mapping")
+  -- getmousepos() reports the last line for a click on the empty rows below
+  -- it, with a screen row that no longer matches that line.
+  local below = mouse_over(panel.win, vim.api.nvim_buf_line_count(panel.buf))
+  below.screenrow = below.screenrow + 5
+  assert(press(right_click, below) == "", "a right click on the panel's empty area fell through to Neovim")
+  wait_for(menu_window, "the panel's empty area offered no menu at all")
+  local panel_menu = table.concat(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(menu_window()), 0, -1, false), "\n")
+  for _, label in ipairs({ "Stage All Changes", "Collapse All Sections", "Refresh" }) do
+    assert(panel_menu:find(label, 1, true), ("the panel menu is missing `%s`"):format(label))
+  end
+
+  -- Pressing the right button again lands on the menu itself. It arrives as
+  -- <2-RightMouse>, which the menu's own mapping does not cover, so the global
+  -- one has to refuse to hand it back -- Neovim would open its PopUp on top.
+  local double_right = assert(global_mapping("<2-RightMouse>"), "no global <2-RightMouse> mapping")
+  local on_menu = mouse_over(menu_window(), 1)
+  assert(press(double_right, on_menu) == "", "a second right click on the menu fell through to Neovim")
+  assert(press(right_click, on_menu) == "", "a right click on the menu fell through to Neovim")
+  ContextMenu.close()
+  vim.wait(100)
+
+  -- A commit row has no actions of its own, and answers with the panel's.
+  local commit_line
+  for line, entry in pairs(panel.entries or {}) do
+    if entry.kind == "commit" then
+      commit_line = line
+    end
+  end
+  if commit_line then
+    assert(press(right_click, mouse_over(panel.win, commit_line)) == "", "a right click on a commit fell through")
+    wait_for(menu_window, "a commit row offered no menu")
+    local commit_menu =
+      table.concat(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(menu_window()), 0, -1, false), "\n")
+    assert(commit_menu:find("Copy Commit Hash", 1, true), "a commit row cannot copy its hash")
+    ContextMenu.close()
+    vim.wait(100)
+  end
+
+  -- Ordinary buffers keep Neovim's own menu.
+  vim.api.nvim_set_current_win(editor)
+  local in_editor = mouse_over(editor, 1)
+  assert(press(right_click, in_editor) ~= "", "the editor lost Neovim's own right-click menu")
+
   -- A right click somewhere else replaces the menu instead of stacking one on
   -- top of it.
   open_menu()
