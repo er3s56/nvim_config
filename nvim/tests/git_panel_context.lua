@@ -38,9 +38,9 @@ local render_state = {
   buf = panel_buf,
   win = panel_win,
   branch = "test",
-  changes = { { kind = "worktree_file", status = " M", path = short_path } },
+  changes = { { kind = "worktree_file", group = "changes", letter = "M", status = " M", path = short_path } },
   commits = { { kind = "commit", full_hash = commit_hash, hash = "aaaaaaa", subject = "subject" } },
-  collapsed = { changes = false, commits = false },
+  collapsed = { merge = false, staged = false, changes = false, commits = false },
   expanded = { [commit_hash] = true },
   commit_files = {
     [commit_hash] = {
@@ -50,6 +50,7 @@ local render_state = {
 }
 GitPanel._render(render_state)
 local rendered = vim.api.nvim_buf_get_lines(panel_buf, 0, -1, false)
+assert(rendered[4]:find("CHANGES", 1, true), "an empty STAGED CHANGES group took up a row of its own")
 assert(rendered[5]:find(short_path, 1, true), "CHANGES path was proactively abbreviated")
 assert(rendered[9]:find("lua/config/module.lua", 1, true), "expanded commit path was proactively abbreviated")
 
@@ -61,6 +62,8 @@ assert(vim.fn.writefile({ "workspace" }, absolute) == 0)
 
 local renamed = {
   kind = "worktree_file",
+  group = "staged",
+  letter = "R",
   status = "R ",
   old_path = "old/location/file.txt",
   path = renamed_path,
@@ -74,16 +77,21 @@ assert(menu_entry(renamed_menu, "Unstage Changes").enabled, "a staged rename cou
 assert(not menu_entry(renamed_menu, "Stage Changes").enabled, "a staged rename offered to stage again")
 assert(not menu_entry(renamed_menu, "Discard Changes").enabled, "a staged rename offered to discard nothing")
 
-local unstaged = { kind = "worktree_file", status = " M", path = renamed_path }
+local unstaged = { kind = "worktree_file", group = "changes", letter = "M", status = " M", path = renamed_path }
 local unstaged_menu = GitPanel._workspace_context_entries(state, unstaged)
 assert(menu_entry(unstaged_menu, "Open Changes"), "a change row cannot open its diff from the menu")
 assert(menu_entry(unstaged_menu, "Stage Changes").enabled, "an unstaged change could not be staged")
 assert(menu_entry(unstaged_menu, "Discard Changes").enabled, "an unstaged change could not be discarded")
 assert(not menu_entry(unstaged_menu, "Unstage Changes").enabled, "an unstaged change offered to unstage")
 
--- The CHANGES header acts on every change under it, but never offers to throw
--- all of them away.
+-- A section header acts on every change under it, but never offers to throw
+-- all of them away -- and "under it" means its own group: a file that is both
+-- staged and modified has a row in each, and each row is acted on separately.
 local section = { kind = "section", section = "changes" }
+local both = {
+  { kind = "worktree_file", group = "staged", letter = "M", status = "MM", path = renamed_path },
+  { kind = "worktree_file", group = "changes", letter = "M", status = "MM", path = renamed_path },
+}
 local section_state = { root = root, buf = panel_buf, win = panel_win, entries = {}, changes = { unstaged } }
 local section_menu = GitPanel._workspace_context_entries(section_state, section)
 assert(menu_entry(section_menu, "Stage All Changes").enabled, "the section could not stage everything")
@@ -92,12 +100,25 @@ for _, entry in ipairs(section_menu) do
 end
 assert(#GitPanel._workspace_context_entries({ changes = {} }, section) == 0, "an empty section offered actions")
 
+local staged_section = { kind = "section", section = "staged" }
+local split_state = { root = root, buf = panel_buf, win = panel_win, entries = {}, changes = both }
+local staged_menu = GitPanel._workspace_context_entries(split_state, staged_section)
+assert(menu_entry(staged_menu, "Unstage All Changes").enabled, "STAGED CHANGES could not unstage everything")
+assert(not menu_entry(staged_menu, "Stage All Changes").enabled, "STAGED CHANGES offered to stage what it holds")
+local changes_menu = GitPanel._workspace_context_entries(split_state, section)
+assert(menu_entry(changes_menu, "Stage All Changes").enabled, "CHANGES could not stage everything")
+assert(not menu_entry(changes_menu, "Unstage All Changes").enabled, "CHANGES offered to unstage what it holds")
+-- A group with nothing of its own in it is not a group, whatever the other
+-- groups hold.
+local merge_section = { kind = "section", section = "merge" }
+assert(#GitPanel._workspace_context_entries(split_state, merge_section) == 0, "an empty group offered actions")
+
 local historical = { kind = "commit_file", status = "M", path = renamed_path }
 assert(
   menu_entry(GitPanel._workspace_context_entries(state, historical), "Open File").enabled,
   "historical entry with a current workspace file was disabled"
 )
-local deleted = { kind = "worktree_file", status = "D ", path = "removed.txt" }
+local deleted = { kind = "worktree_file", group = "staged", letter = "D", status = "D ", path = "removed.txt" }
 local deleted_menu = GitPanel._workspace_context_entries(state, deleted)
 assert(not menu_entry(deleted_menu, "Open File").enabled, "deleted workspace file was enabled")
 

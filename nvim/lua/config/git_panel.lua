@@ -92,8 +92,11 @@ local function truncate(text, width)
   return vim.fn.strcharpart(text, 0, math.max(width - 1, 1)) .. "…"
 end
 
+-- Rows show one letter per group, commits show git's own code, so this has to
+-- read both. Untracked is `??` in git's output and `U` on a row; they mean the
+-- same thing to the eye and get the same colour.
 local function status_hl(status)
-  return status:find("?", 1, true) and "DiagnosticInfo"
+  return status:find("[?U]") and "DiagnosticInfo"
     or status:find("D", 1, true) and "DiagnosticError"
     or status:find("M", 1, true) and "DiagnosticWarn"
     or "Special"
@@ -109,10 +112,35 @@ local ROW_ACTIONS = {
   { action = "stage", glyph = "+", label = "Stage Changes", all = "Stage All Changes" },
 }
 
+-- The groups VSCode splits its changes into, in its order. A file that is both
+-- staged and modified gets a row in each of the last two: the index and the
+-- working tree hold different versions of it, and each version is staged,
+-- discarded and diffed on its own.
+local SECTIONS = {
+  { section = "merge", title = "MERGE CHANGES" },
+  { section = "staged", title = "STAGED CHANGES" },
+  { section = "changes", title = "CHANGES" },
+}
+
+local SECTION_TITLES = {}
+for _, group in ipairs(SECTIONS) do
+  SECTION_TITLES[group.section] = group.title
+end
+
+local function changes_in(state, section)
+  local rows = {}
+  for _, change in ipairs(state.changes or {}) do
+    if change.group == section then
+      rows[#rows + 1] = change
+    end
+  end
+  return rows
+end
+
 local function change_actions(changes)
   local allowed = { stage = false, unstage = false, discard = false }
   for _, change in ipairs(changes or {}) do
-    local actions = GitOps.file_actions(change.status)
+    local actions = GitOps.file_actions(change.status, change.group)
     allowed.stage = allowed.stage or actions.stage
     allowed.unstage = allowed.unstage or actions.unstage
     allowed.discard = allowed.discard or actions.discard
@@ -128,12 +156,15 @@ local function entry_actions(state, entry)
     return nil
   end
   if entry.kind == "worktree_file" then
-    return GitOps.file_actions(entry.status), "file"
+    return GitOps.file_actions(entry.status, entry.group), "file"
   end
-  if entry.kind == "section" and entry.section == "changes" and (state.changes or {})[1] then
-    local allowed = change_actions(state.changes)
-    allowed.discard = false
-    return allowed, "all"
+  if entry.kind == "section" and SECTION_TITLES[entry.section] then
+    local rows = changes_in(state, entry.section)
+    if rows[1] then
+      local allowed = change_actions(rows)
+      allowed.discard = false
+      return allowed, "all"
+    end
   end
 end
 
@@ -155,9 +186,9 @@ end
 
 local function section_text(state, section)
   local arrow = state.collapsed[section] and "▸" or "▾"
-  if section == "changes" then
-    local label = state.changes == nil and "loading…" or tostring(#state.changes)
-    return ("  %s CHANGES  %s"):format(arrow, label)
+  if SECTION_TITLES[section] then
+    local label = state.changes == nil and "loading…" or tostring(#changes_in(state, section))
+    return ("  %s %s  %s"):format(arrow, SECTION_TITLES[section], label)
   end
   if section == "timeline" then
     -- The header names the file, the way VSCode's Timeline follows the active
@@ -177,7 +208,15 @@ local function section_text(state, section)
 end
 
 local function row_highlight(entry)
-  return entry.kind == "section" and "Function" or status_hl(entry.status)
+  if entry.kind == "section" then
+    return "Function"
+  end
+  -- A conflict is not the colour of whichever letter its code happens to hold:
+  -- `DU` is not a deletion and `AA` is not an addition.
+  if entry.group == "merge" then
+    return "DiagnosticError"
+  end
+  return status_hl(entry.letter or entry.status)
 end
 
 local function pad_display(text, width)
@@ -200,7 +239,7 @@ local function build_row(state, entry, width, with_buttons)
   if entry.kind == "section" then
     text = section_text(state, entry.section)
   else
-    local prefix = ("  %-2s "):format(entry.status)
+    local prefix = ("  %-2s "):format(entry.letter or entry.status)
     text = prefix .. display_path(entry.path, math.max(available - vim.fn.strdisplaywidth(prefix), 1))
   end
   if #buttons == 0 then
@@ -284,15 +323,21 @@ local function render(state)
   -- The buttons only appear on one row at a time, so the hint has to point at
   -- the menu: it is the one place every action is always listed.
   add("  click/↵ open · right-click menu", "NonText")
-  add("")
-
-  add_row({ kind = "section", section = "changes" })
-  if not state.collapsed.changes and state.changes ~= nil then
-    if #state.changes == 0 then
-      add("    ✓ Working tree clean", "DiagnosticOk")
-    else
-      for _, item in ipairs(state.changes) do
-        add_row(item)
+  for _, group in ipairs(SECTIONS) do
+    local rows = changes_in(state, group.section)
+    -- An empty group is not a group: VSCode shows Merge Changes and Staged
+    -- Changes only once something is in them. CHANGES stays whatever happens,
+    -- because a clean working tree still has to be told somewhere.
+    if #rows > 0 or group.section == "changes" then
+      add("")
+      add_row({ kind = "section", section = group.section })
+      if not state.collapsed[group.section] and state.changes ~= nil then
+        if #rows == 0 then
+          add("    ✓ Working tree clean", "DiagnosticOk")
+        end
+        for _, item in ipairs(rows) do
+          add_row(item)
+        end
       end
     end
   end
@@ -467,6 +512,35 @@ local function follow_active_row(state)
   render_row(state, current)
 end
 
+-- Where a status puts its file, and what the row shows there. Each group is
+-- about one column of git's two-letter code, so a row shows the column its own
+-- group is about rather than repeating both -- except a conflict, where both
+-- letters carry state and neither reading applies.
+--
+-- Staged comes first so that a diff whose group later empties out falls back
+-- to the index side of the file rather than to whatever else is left of it.
+local function status_rows(status, path, old_path)
+  local base = { kind = "worktree_file", status = status, path = path, old_path = old_path }
+  local function row(group, letter)
+    return vim.tbl_extend("force", base, { group = group, letter = letter })
+  end
+  if GitOps.is_unmerged(status) then
+    return { row("merge", status) }
+  end
+  if status == "??" then
+    return { row("changes", "U") }
+  end
+  local rows = {}
+  local index, worktree = status:sub(1, 1), status:sub(2, 2)
+  if index ~= " " and index ~= "" then
+    rows[#rows + 1] = row("staged", index)
+  end
+  if worktree ~= " " and worktree ~= "" then
+    rows[#rows + 1] = row("changes", worktree)
+  end
+  return rows
+end
+
 local function parse_status(output)
   local branch = "Git"
   local changes = {}
@@ -485,12 +559,7 @@ local function parse_status(output)
         index = index + 1
         old_path = records[index]
       end
-      changes[#changes + 1] = {
-        kind = "worktree_file",
-        status = status,
-        path = path,
-        old_path = old_path,
-      }
+      vim.list_extend(changes, status_rows(status, path, old_path))
     end
     index = index + 1
   end
@@ -1051,9 +1120,16 @@ local function preview_buffer(listed, name, path, content)
   return buf
 end
 
+-- Which row of which file, for the previews keyed by it. A file that is both
+-- staged and modified has two rows, and they are two different diffs.
+local function row_key(entry)
+  return (entry.path or "") .. "\0" .. (entry.group or "")
+end
+
 local function entry_key(entry)
   return table.concat({
     entry.kind or "file",
+    entry.group or "",
     entry.commit or "worktree",
     entry.status or "",
     entry.old_path or "",
@@ -1069,10 +1145,13 @@ end
 -- Only worktree previews go stale this way. A commit's contents do not
 -- change, so a commit diff stays valid however the working tree moves.
 function drop_stale_worktree_preview(state)
-  local live, by_path = {}, {}
+  local live, by_row, by_path = {}, {}, {}
   for _, change in ipairs(state.changes or {}) do
     live[entry_key(change)] = true
-    by_path[change.path] = change
+    by_row[row_key(change)] = change
+    -- Staged rows are built first, so a diff whose own group has emptied out
+    -- falls back to the index side of the file rather than away from it.
+    by_path[change.path] = by_path[change.path] or change
   end
   -- Cached previews are reconciled too, not just the visible one: the cache is
   -- keyed by entry, so a file that comes back with the same status would
@@ -1081,7 +1160,7 @@ function drop_stale_worktree_preview(state)
   for key, preview in pairs(state.previews or {}) do
     local entry = preview.entry
     if entry and entry.kind == "worktree_file" then
-      local replacement = by_path[entry.path]
+      local replacement = by_row[row_key(entry)] or by_path[entry.path]
       if replacement then
         surviving[#surviving + 1] = { preview = preview, key = key, entry = replacement, moved = not live[key] }
       else
@@ -1094,7 +1173,8 @@ function drop_stale_worktree_preview(state)
   end
   for _, item in ipairs(surviving) do
     -- Staging one hunk of a modified file moves it from " M" to "MM", which is
-    -- a different entry and so a different key. Re-key and re-read rather than
+    -- a different entry and so a different key -- and staging the whole file
+    -- moves the diff into the staged group. Re-key and re-read rather than
     -- closing: VSCode leaves the diff editor open across a staged hunk, and the
     -- window the reader is working in has no business disappearing under them.
     if item.moved then
@@ -1729,10 +1809,16 @@ local function preview_specs(entry)
       after_label = "After · worktree",
     }
   end
-  if worktree_status ~= " " then
+  -- Which of the two versions the row is about. A row knows from its group; an
+  -- entry built without one is read off the status, the way every row was
+  -- before the panel had groups.
+  local indexed = entry.group == "staged" or (not entry.group and worktree_status == " ")
+  if not indexed then
     return {
       mode = "unstaged",
-      before_spec = ":" .. (entry.old_path or entry.path),
+      -- Against the index entry for the path as it is named now: a rename is
+      -- already recorded there under the new name, and the old one is gone.
+      before_spec = ":" .. entry.path,
       after_worktree = worktree_status ~= "D" and entry.path or nil,
       before_label = "Before · index",
       after_label = "After · worktree",
@@ -2090,16 +2176,17 @@ local function action_paths(action, changes)
   return paths
 end
 
--- What a row's action applies to. A section header covers every change the
--- action is actually possible for: handing git a path it cannot stage or
--- unstage turns the whole batch into an error.
+-- What a row's action applies to. A section header covers the rows of its own
+-- group, and of those only the ones the action is actually possible for:
+-- handing git a path it cannot stage or unstage turns the whole batch into an
+-- error.
 local function changes_for(state, entry, scope, action)
   if scope ~= "all" then
     return { entry }
   end
   local changes = {}
-  for _, change in ipairs(state.changes or {}) do
-    if GitOps.file_actions(change.status)[action] then
+  for _, change in ipairs(changes_in(state, entry.section)) do
+    if GitOps.file_actions(change.status, change.group)[action] then
       changes[#changes + 1] = change
     end
   end
@@ -2430,7 +2517,7 @@ local function preview_context_entries(state, preview, side, mouse)
 
   local entry = preview.entry
   if entry.kind == "worktree_file" then
-    local allowed = GitOps.file_actions(entry.status)
+    local allowed = GitOps.file_actions(entry.status, entry.group)
     if #entries > 0 then
       entries[#entries + 1] = { separator = true }
     end
@@ -3238,6 +3325,8 @@ function M.open(explorer, root, attempt, open_opts)
     branch = "Git",
     entries = {},
     collapsed = {
+      merge = false,
+      staged = false,
       changes = false,
       commits = false,
       timeline = false,

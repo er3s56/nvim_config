@@ -98,8 +98,8 @@ local ok, test_error = pcall(function()
   assert(GitOps.apply_hunk("a\nb\n", "a\nB", ends_bare[1]) == "a\nB", "the missing final newline was invented")
 
   -- ── which actions a status allows ─────────────────────────────────────
-  local function actions(status)
-    local allowed = GitOps.file_actions(status)
+  local function actions(status, group)
+    local allowed = GitOps.file_actions(status, group)
     local function mark(allow, letter)
       return allow and letter or "-"
     end
@@ -111,6 +111,17 @@ local ok, test_error = pcall(function()
   assert(actions("??") == "s-d", "an untracked file must offer stage and discard")
   assert(actions("A ") == "-u-", "a newly staged file must offer unstage only")
   assert(actions("UU") == "s-d", "a conflict must offer stage (resolve) and discard")
+
+  -- A row in a group acts on that group's column alone, so the two rows a
+  -- partly staged file gets offer opposite things -- and neither of them
+  -- offers what the other one is for.
+  assert(actions("MM", "staged") == "-u-", "the staged row of a partly staged file must unstage only")
+  assert(actions("MM", "changes") == "s-d", "the unstaged row of a partly staged file must stage and discard")
+  assert(actions("M ", "staged") == "-u-", "a staged change must unstage from its own group")
+  assert(actions(" M", "changes") == "s-d", "an unstaged change must stage and discard from its own group")
+  assert(actions("A ", "staged") == "-u-", "a staged addition must unstage from its own group")
+  assert(actions("??", "changes") == "s-d", "an untracked file must stage and discard from its own group")
+  assert(actions("UU", "merge") == "s-d", "a conflict must stage (resolve) and discard from its own group")
 
   -- ── against a real repository ─────────────────────────────────────────
   git({ "init", "-q" })

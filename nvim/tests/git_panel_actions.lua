@@ -52,10 +52,20 @@ local function wait_for_change(panel, path, wanted)
   assert(status_of(path) == wanted, ("git disagrees with the panel about `%s`"):format(path))
 end
 
--- The panel row for a change, and where its buttons ended up on screen.
-local function row_of(panel, path)
+-- The panel row for a change, and where its buttons ended up on screen. A file
+-- that is both staged and modified has one row per group, so a lookup that
+-- does not name a group can be answered by either of them.
+local function row_of(panel, path, group)
   for line, entry in pairs(panel.entries or {}) do
-    if entry.kind == "worktree_file" and entry.path == path then
+    if entry.kind == "worktree_file" and entry.path == path and (group == nil or entry.group == group) then
+      return line
+    end
+  end
+end
+
+local function section_row(panel, section)
+  for line, entry in pairs(panel.entries or {}) do
+    if entry.kind == "section" and entry.section == section then
       return line
     end
   end
@@ -186,6 +196,95 @@ local ok, test_error = pcall(function()
   activate()
   wait_for_change(panel, relative, nil)
   assert(vim.fn.readfile(file)[1] == committed[1], "discarding did not restore the file")
+
+  -- ── a partly staged file has a row in each group ──────────────────────
+  -- The index and the working tree hold different versions of it, so VSCode
+  -- lists it under both Staged Changes and Changes. Staging what is on disk
+  -- now is not the same action as unstaging what was staged before, and
+  -- neither is a diff of one the diff of the other.
+  assert(vim.fn.writefile({ "ONE", "two", "three" }, file) == 0)
+  GitPanel.refresh(panel.buf, { status_only = true })
+  wait_for_change(panel, relative, " M")
+  assert(section_row(panel, "staged") == nil, "an empty STAGED CHANGES group was rendered")
+
+  local unstaged_row = assert(row_of(panel, relative, "changes"), "the modified file has no row in CHANGES")
+  GitPanel._handle_mouse_move(mouse_for(panel, unstaged_row, 1))
+  local to_stage = assert(button_named(panel, unstaged_row, "stage"), "the CHANGES row offered no stage button")
+  GitPanel._activate_click(panel, mouse_for(panel, unstaged_row, to_stage.from))
+  wait_for_change(panel, relative, "M ")
+  assert(row_of(panel, relative, "changes") == nil, "a fully staged file was left in CHANGES")
+  assert(row_of(panel, relative, "staged"), "a staged file never reached STAGED CHANGES")
+
+  assert(vim.fn.writefile({ "ONE", "TWO", "three" }, file) == 0)
+  GitPanel.refresh(panel.buf, { status_only = true })
+  wait_for_change(panel, relative, "MM")
+
+  local staged_row = assert(row_of(panel, relative, "staged"), "a partly staged file left STAGED CHANGES")
+  local changed_row = assert(row_of(panel, relative, "changes"), "a partly staged file never reached CHANGES")
+  assert(staged_row ~= changed_row, "the two groups share one row")
+  assert(section_row(panel, "staged") < staged_row, "the staged row is not under the STAGED CHANGES header")
+  assert(section_row(panel, "changes") < changed_row, "the unstaged row is not under the CHANGES header")
+  assert(section_row(panel, "staged") < section_row(panel, "changes"), "STAGED CHANGES is not above CHANGES")
+  assert(
+    vim.api.nvim_buf_get_lines(panel.buf, staged_row - 2, staged_row - 1, false)[1]:find("STAGED CHANGES", 1, true),
+    "the STAGED CHANGES header does not say what it holds"
+  )
+
+  -- Each row shows the one column of the status its own group is about, so
+  -- neither of them reads `MM`.
+  for _, row in ipairs({ staged_row, changed_row }) do
+    local text = vim.api.nvim_buf_get_lines(panel.buf, row - 1, row, false)[1]
+    assert(not text:find("MM", 1, true), "a grouped row still shows both status columns")
+    assert(text:find("M", 1, true), "a grouped row lost its status letter")
+  end
+
+  -- ...and offers only what that column allows.
+  GitPanel._handle_mouse_move(mouse_for(panel, staged_row, 1))
+  assert(button_named(panel, staged_row, "unstage"), "the STAGED CHANGES row could not unstage")
+  assert(not button_named(panel, staged_row, "stage"), "the STAGED CHANGES row offered to stage again")
+  assert(not button_named(panel, staged_row, "discard"), "the STAGED CHANGES row offered to discard the index")
+  GitPanel._handle_mouse_move(mouse_for(panel, changed_row, 1))
+  assert(button_named(panel, changed_row, "stage"), "the CHANGES row could not stage")
+  assert(button_named(panel, changed_row, "discard"), "the CHANGES row could not discard")
+  assert(not button_named(panel, changed_row, "unstage"), "the CHANGES row offered to unstage the working tree")
+
+  -- The point of the split: the two rows open two different diffs.
+  local function open_row(line)
+    vim.api.nvim_set_current_win(panel.win)
+    vim.api.nvim_win_set_cursor(panel.win, { line, 0 })
+    vim.fn.maparg("<CR>", "n", false, true).callback()
+    local group = panel.entries[line].group
+    assert(
+      vim.wait(5000, function()
+        return panel.preview ~= nil and panel.preview.entry.group == group
+      end, 50),
+      ("the diff for the %s row never opened"):format(group)
+    )
+    return panel.preview
+  end
+
+  local staged_diff = open_row(staged_row)
+  assert(staged_diff.mode == "staged", "the STAGED CHANGES row opened in mode " .. tostring(staged_diff.mode))
+  assert(staged_diff.before == "one\ntwo\nthree\n", "the staged diff does not start from HEAD")
+  assert(staged_diff.after == "ONE\ntwo\nthree\n", "the staged diff does not end at the index")
+
+  local changed_diff = open_row(row_of(panel, relative, "changes"))
+  assert(changed_diff.mode == "unstaged", "the CHANGES row opened in mode " .. tostring(changed_diff.mode))
+  assert(changed_diff.before == "ONE\ntwo\nthree\n", "the unstaged diff does not start from the index")
+  assert(changed_diff.after == "ONE\nTWO\nthree\n", "the unstaged diff does not end at the working tree")
+  assert(staged_diff ~= changed_diff, "both rows of the file opened the same diff")
+
+  -- Unstaging from the header takes the group's rows and nothing else: the
+  -- working tree keeps the edit that was never staged.
+  vim.api.nvim_set_current_win(panel.win)
+  local header = assert(section_row(panel, "staged"), "STAGED CHANGES lost its header")
+  GitPanel._handle_mouse_move(mouse_for(panel, header, 1))
+  local unstage_all = assert(button_named(panel, header, "unstage"), "STAGED CHANGES offered no unstage button")
+  assert(not button_named(panel, header, "discard"), "STAGED CHANGES offered to discard every staged change")
+  GitPanel._activate_click(panel, mouse_for(panel, header, unstage_all.from))
+  wait_for_change(panel, relative, " M")
+  assert(section_row(panel, "staged") == nil, "STAGED CHANGES stayed on screen with nothing in it")
+  assert(table.concat(vim.fn.readfile(file), "\n") == "ONE\nTWO\nthree", "unstaging touched the working tree")
 end)
 
 pcall(ActivityBar.close)

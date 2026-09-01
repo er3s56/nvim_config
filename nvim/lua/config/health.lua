@@ -184,7 +184,7 @@ local function check_git_panel()
       vim.health.error(("a state is keyed by buffer %s, which no longer exists"):format(buf))
     else
       vim.health.info(
-        ("%s: %d change(s), %d commit(s)%s%s"):format(
+        ("%s: %d change row(s), %d commit(s)%s%s"):format(
           vim.fn.fnamemodify(state.root or "?", ":~"),
           #(state.changes or {}),
           #(state.commits or {}),

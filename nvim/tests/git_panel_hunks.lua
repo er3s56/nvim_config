@@ -152,7 +152,13 @@ local ok, test_error = pcall(function()
   end
   assert(labels["Stage Hunk"], "the diff menu cannot stage the hunk under the pointer")
   assert(labels["Discard Hunk"], "the diff menu cannot discard the hunk under the pointer")
-  assert(labels["Unstage Changes"], "the diff menu lost the whole-file actions")
+  -- The whole-file actions are the ones the row this diff came from has. That
+  -- row is in CHANGES -- staging one hunk left the other one unstaged -- so
+  -- unstaging belongs to the file's other row, in STAGED CHANGES, and is not
+  -- on offer here however staged the rest of the file now is.
+  assert(labels["Stage Changes"], "the diff menu lost the whole-file actions")
+  assert(labels["Discard Changes"], "the diff of an unstaged change could not discard the file")
+  assert(labels["Unstage Changes"] == false, "the diff of an unstaged change offered to unstage it")
   local away = GitPanel._preview_context_entries(panel, panel.preview, "after", { line = 4 })
   for _, item in ipairs(away) do
     if item.label == "Stage Hunk" then

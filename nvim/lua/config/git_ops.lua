@@ -77,11 +77,12 @@ function M.is_unmerged(status)
   return UNMERGED[status or ""] == true
 end
 
--- Which operations a status code allows. VSCode answers this by which group a
--- row sits in; this panel keeps a single list, so the two-letter code has to
--- answer it directly -- the index column drives unstaging, the worktree column
--- drives staging and discarding.
-function M.file_actions(status)
+-- Which operations a row allows. VSCode answers this by which group the row
+-- sits in, and so does the panel: a file that is both staged and modified has
+-- a row in each of the two groups, and each row acts on the one column of the
+-- status its group is about. Passing no group asks the code to answer alone,
+-- which is every column at once.
+function M.file_actions(status, group)
   status = status or ""
   if M.is_unmerged(status) then
     -- Staging a conflicted path is how git records it as resolved, and
@@ -92,11 +93,17 @@ function M.file_actions(status)
     return { stage = true, unstage = false, discard = true }
   end
   local index, worktree = status:sub(1, 1), status:sub(2, 2)
-  return {
-    stage = worktree ~= " " and worktree ~= "",
-    unstage = index ~= " " and index ~= "",
-    discard = worktree ~= " " and worktree ~= "",
-  }
+  local staged = index ~= " " and index ~= ""
+  local dirty = worktree ~= " " and worktree ~= ""
+  if group == "staged" then
+    -- The index side of the file. Discarding is not offered here: what the
+    -- staged group can throw away is the staging, which is unstaging.
+    return { stage = false, unstage = staged, discard = false }
+  end
+  if group == "changes" then
+    return { stage = dirty, unstage = false, discard = dirty }
+  end
+  return { stage = dirty, unstage = staged, discard = dirty }
 end
 
 -- ── text ────────────────────────────────────────────────────────────────
