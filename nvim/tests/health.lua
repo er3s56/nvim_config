@@ -76,7 +76,7 @@ vim.wait(1000)
 
 local live = report()
 has(live, "view=git", "the report did not name the open view")
-has(live, "1 change(s), 1 commit(s)", "the report did not reflect the repository state")
+has(live, "1 change row(s), 1 commit(s)", "the report did not reflect the repository state")
 has(live, ".git watcher(s) running", "the running Git watcher was not reported")
 has(live, "every registered watch is running", "the file watchers were not reported healthy")
 has(live, "directory watch(es) open process-wide", "the watch total was not reported")
