@@ -1264,6 +1264,27 @@ local function list_index_at(list, line)
   return index
 end
 
+-- A press that lands anywhere but buffer text -- a window separator, a status
+-- line -- begins a resize, and that gesture belongs to Neovim from press to
+-- release. The panels swallow <LeftDrag> over themselves so a drag cannot
+-- select their text, but dragging the sidebar border leftwards takes the
+-- pointer straight into the panel, and swallowing it there made the sidebar
+-- possible to widen and impossible to narrow again. Dragging the border is the
+-- only language it speaks, and half of it was being eaten.
+--
+-- The release needs no handling: <LeftDrag> only arrives while the button is
+-- down, and the next press recomputes this.
+local border_gesture = false
+
+function M._note_press(mouse)
+  border_gesture = mouse ~= nil and (mouse.line or 0) < 1
+  return border_gesture
+end
+
+function M._dragging_border()
+  return border_gesture
+end
+
 function M._handle_list_click(mouse)
   local state = state_for(tab_for_win(mouse and mouse.winid), false)
   local picker = state and state.content and state.content.picker or nil
@@ -1570,6 +1591,7 @@ function M.setup()
 
   vim.keymap.set({ "n", "x", "i", "t" }, "<LeftMouse>", function()
     local mouse = vim.fn.getmousepos()
+    M._note_press(mouse)
     -- A press outside an open menu dismisses it and does nothing else. This
     -- has to come first: the handlers below swallow presses over their own
     -- panels, and a swallowed press would leave the menu on screen.
@@ -1618,6 +1640,9 @@ function M.setup()
     local consume = gesture.consume
     vim.keymap.set({ "n", "x", "i", "t" }, key, function()
       local mouse = vim.fn.getmousepos()
+      if border_gesture then
+        return key
+      end
       local scrollbar = package.loaded["config.picker_scrollbar"]
       if scrollbar and consume(scrollbar, mouse) then
         return ""

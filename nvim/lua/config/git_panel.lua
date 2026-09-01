@@ -2105,6 +2105,22 @@ end
 -- nothing about. Hand anything not ours back to the Activity Bar's rule
 -- before letting it through, or dragging inside those panels starts selecting
 -- their text again.
+-- A gesture that began on a window separator or a status line is a resize, and
+-- it belongs to Neovim until the button comes up: dragging the sidebar border
+-- leftwards moves the pointer over the panel, and swallowing the drag there
+-- left the border draggable in one direction only.
+local function dragging_border()
+  local activity = package.loaded["config.activity_bar"]
+  return activity ~= nil and activity._dragging_border ~= nil and activity._dragging_border() == true
+end
+
+local function note_press(mouse)
+  local activity = package.loaded["config.activity_bar"]
+  if activity and activity._note_press then
+    activity._note_press(mouse)
+  end
+end
+
 local function swallow_outside_panel(mouse, key)
   local activity = package.loaded["config.activity_bar"]
   if activity and activity._over_panel and activity._over_panel(mouse) then
@@ -2718,6 +2734,7 @@ local function setup_global_mouse_mappings()
     local key = lhs
     vim.keymap.set({ "n", "x", "i" }, key, function()
       local state, mouse = mouse_panel_target()
+      note_press(mouse)
       -- A press outside an open menu dismisses it and does nothing else. This
       -- has to come first: everything below swallows presses over a panel, and
       -- a swallowed press would leave the menu on screen.
@@ -2776,6 +2793,9 @@ local function setup_global_mouse_mappings()
   end, { expr = true, silent = true, desc = "Track the Git panel's hovered row" })
 
   vim.keymap.set({ "n", "x", "i" }, "<LeftDrag>", function()
+    if dragging_border() then
+      return "<LeftDrag>"
+    end
     local state, mouse = mouse_panel_target()
     if state then
       vim.schedule(function()
@@ -2790,6 +2810,9 @@ local function setup_global_mouse_mappings()
     return swallow_outside_panel(mouse, "<LeftDrag>")
   end, { expr = true, silent = true, desc = "Position Git panel cursor" })
   vim.keymap.set({ "n", "x", "i" }, "<LeftRelease>", function()
+    if dragging_border() then
+      return "<LeftRelease>"
+    end
     local scrollbar = package.loaded["config.picker_scrollbar"]
     if scrollbar and scrollbar.handle_release and scrollbar.handle_release() then
       return ""
@@ -3472,6 +3495,7 @@ function M.open(explorer, root, attempt, open_opts)
     local key = lhs
     vim.keymap.set({ "n", "x" }, key, function()
       local mouse = vim.fn.getmousepos()
+      note_press(mouse)
       if ContextMenu.dismiss(mouse) then
         return ""
       end
@@ -3507,7 +3531,7 @@ function M.open(explorer, root, attempt, open_opts)
     })
   end
   vim.keymap.set({ "n", "x" }, "<LeftDrag>", function()
-    local mouse = panel_mouse()
+    local mouse = not dragging_border() and panel_mouse() or nil
     if mouse then
       vim.schedule(function()
         position_mouse(mouse)
@@ -3517,7 +3541,7 @@ function M.open(explorer, root, attempt, open_opts)
     return "<LeftDrag>"
   end, { buffer = buf, expr = true, silent = true, desc = "Position Git panel cursor" })
   vim.keymap.set({ "n", "x" }, "<LeftRelease>", function()
-    return panel_mouse() and "" or "<LeftRelease>"
+    return (not dragging_border() and panel_mouse()) and "" or "<LeftRelease>"
   end, { buffer = buf, expr = true, silent = true, desc = "Toggle or open Git panel item" })
   vim.keymap.set("x", ":", "<Esc>:", {
     buffer = buf,

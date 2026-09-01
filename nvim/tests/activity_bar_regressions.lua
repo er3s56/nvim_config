@@ -376,6 +376,33 @@ local ok, test_error = pcall(function()
   )
   assert_panels_swallow(state.content.picker, "once the Git panel has been opened")
 
+  -- Dragging the sidebar border is the only way a user can resize it, and
+  -- dragging it back leftwards takes the pointer over the panel, where the rule
+  -- above swallows the drag. The sidebar could be widened and never narrowed.
+  -- A gesture that starts anywhere but on buffer text -- a separator, a status
+  -- line -- is a resize, and belongs to Neovim until the button comes up.
+  local sidebar_win = assert(ActivityBar._content_root(ActivityBar.current().content))
+  local function deliver(key, win, line)
+    local mapping = vim.fn.maparg(key, "n", false, true)
+    assert(type(mapping.callback) == "function", key .. " has no handler")
+    vim.fn.getmousepos = function()
+      return { winid = win, screenrow = 1, screencol = 1, winrow = 1, wincol = 1, line = line, column = 1 }
+    end
+    local produced = mapping.callback()
+    vim.fn.getmousepos = real_getmousepos
+    return produced
+  end
+
+  -- A press on the border, then a drag that has moved over the panel.
+  deliver("<LeftMouse>", sidebar_win, 0)
+  assert(deliver("<LeftDrag>", sidebar_win, 1) ~= "", "a drag that began on the border was swallowed by the panel")
+  assert(deliver("<LeftRelease>", sidebar_win, 1) ~= "", "the release that ends a border drag was swallowed")
+
+  -- A press that lands on text starts nothing of the sort, and the panel goes
+  -- back to swallowing drags so they cannot select its contents.
+  deliver("<LeftMouse>", assert(ActivityBar.editor_window()), 1)
+  assert(deliver("<LeftDrag>", sidebar_win, 1) == "", "a drag inside the panel can select its text again")
+
   -- Losing the Activity Bar column must take its sidebar down with it.
   local tab = state.tab
   vim.api.nvim_win_close(state.activity.win, true)
