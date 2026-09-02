@@ -100,6 +100,7 @@ return {
         },
       },
       terminal = {
+        auto_insert = false,
         win = {
           keys = {
             q = { function() end, desc = "Disabled in project panels" },

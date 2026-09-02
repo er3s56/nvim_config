@@ -152,21 +152,26 @@ local ok, test_error = pcall(function()
 
   terminal_group = assert(TerminalTabs._groups[root])
   terminal_win = terminal_group.active.terminal.win
+  -- A click in the terminal now leaves Terminal-Insert so that it positions
+  -- the cursor, and typing resumes on the release. Both halves have to know a
+  -- managed terminal from any other window. (That the press half fires only
+  -- from Terminal-Insert cannot be seen here: `startinsert` takes effect when
+  -- the input loop next runs, which a script never reaches.)
   vim.api.nvim_set_current_win(editor_win)
-  assert(
-    ActivityBar._queue_terminal_insert({ winid = terminal_win }),
-    "terminal mouse fallback did not recognize the managed terminal"
-  )
+  assert(TerminalTabs.owns_window(terminal_win), "the managed terminal's window was not recognised")
+  assert(not TerminalTabs.owns_window(editor_win), "the editor was mistaken for the terminal")
+  assert(not TerminalTabs.press_needs_normal(editor_win), "a press in the editor was treated as one in a terminal")
+
+  vim.api.nvim_set_current_win(terminal_win)
+  assert(TerminalTabs.resume_typing(terminal_win), "the release did not hand the terminal back to typing")
   assert(
     vim.wait(1000, function()
       return vim.api.nvim_get_current_win() == terminal_win
     end),
-    "terminal mouse fallback did not focus the terminal"
+    "resuming typing did not focus the terminal"
   )
-  assert(
-    not ActivityBar._queue_terminal_insert({ winid = editor_win }),
-    "terminal mouse fallback consumed a non-terminal window"
-  )
+  assert(not TerminalTabs.resume_typing(editor_win), "the editor was handed back to a terminal's typing")
+
   vim.api.nvim_set_current_win(terminal_win)
   vim.cmd.PanelClose()
   assert(not terminal_group.visible, "PanelClose in a terminal did not hide the terminal")

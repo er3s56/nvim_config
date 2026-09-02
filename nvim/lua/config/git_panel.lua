@@ -2292,10 +2292,6 @@ local function swallow_outside_panel(mouse, key)
   if activity and activity._over_panel and activity._over_panel(mouse) then
     return ""
   end
-  local scrollbar = package.loaded["config.picker_scrollbar"]
-  if scrollbar and scrollbar._over_terminal and scrollbar._over_terminal(mouse) then
-    return ""
-  end
   return key
 end
 
@@ -2901,6 +2897,7 @@ local function setup_global_mouse_mappings()
     vim.keymap.set({ "n", "x", "i" }, key, function()
       local state, mouse = mouse_panel_target()
       note_press(mouse)
+      TerminalTabs.note_press()
       -- A press outside an open menu dismisses it and does nothing else. This
       -- has to come first: everything below swallows presses over a panel, and
       -- a swallowed press would leave the menu on screen.
@@ -2938,13 +2935,15 @@ local function setup_global_mouse_mappings()
         if activity and activity._over_panel and activity._over_panel(mouse) then
           return ""
         end
-        if scrollbar and scrollbar._over_terminal and scrollbar._over_terminal(mouse) then
-          return ""
-        end
       end
-      queue_terminal_insert(mouse and mouse.winid)
+      -- Let a press in the terminal leave Terminal-Insert first, so the click
+      -- itself positions the cursor and a drag anchors where it was aimed.
+      -- Typing resumes on the release, once it is clear nothing was selected.
+      if TerminalTabs.press_needs_normal(mouse and mouse.winid) then
+        return "<C-\\><C-n>" .. key
+      end
       return key
-    end, { expr = true, silent = true, desc = "Toggle or open Git panel item" })
+    end, { expr = true, replace_keycodes = true, silent = true, desc = "Toggle or open Git panel item" })
   end
   -- VSCode reveals a row's actions when the pointer is over it. In a terminal
   -- that needs 'mousemoveevent', which the panel switches on for as long as it
@@ -2978,6 +2977,16 @@ local function setup_global_mouse_mappings()
   vim.keymap.set({ "n", "x", "i" }, "<LeftRelease>", function()
     if dragging_border() then
       return "<LeftRelease>"
+    end
+    -- A selection dragged out in the terminal is finished here: copied, and
+    -- the terminal handed back to typing.
+    TerminalTabs.note_release()
+    if TerminalTabs.pending_selection() then
+      vim.schedule(TerminalTabs.copy_selection)
+      return ""
+    end
+    if TerminalTabs.resume_typing() then
+      return ""
     end
     local scrollbar = package.loaded["config.picker_scrollbar"]
     if scrollbar and scrollbar.handle_release and scrollbar.handle_release() then
@@ -3660,6 +3669,7 @@ function M.open(explorer, root, attempt, open_opts)
     vim.keymap.set({ "n", "x" }, key, function()
       local mouse = vim.fn.getmousepos()
       note_press(mouse)
+      TerminalTabs.note_press()
       if ContextMenu.dismiss(mouse) then
         return ""
       end
@@ -3685,11 +3695,11 @@ function M.open(explorer, root, attempt, open_opts)
       if key ~= "<LeftMouse>" then
         return ""
       end
-      queue_terminal_insert(mouse.winid)
       return key
     end, {
       buffer = buf,
       expr = true,
+      replace_keycodes = true,
       silent = true,
       desc = "Toggle or open Git panel item",
     })
@@ -3817,7 +3827,12 @@ vim.api.nvim_create_autocmd("WinEnter", {
     -- can switch the terminal back to Terminal-Normal ("nt") afterwards.
     -- Run once the window transition is complete so one click is enough to
     -- focus the project terminal and send subsequent keys to its job.
-    queue_terminal_insert(vim.api.nvim_get_current_win(), { focus = false })
+    -- Not while the mouse is down: a press in the terminal may be the start
+    -- of a drag, and Terminal-Insert would pull the cursor to the prompt and
+    -- anchor the selection there. The release enters it instead.
+    if not TerminalTabs.button_down() then
+      queue_terminal_insert(vim.api.nvim_get_current_win(), { focus = false })
+    end
   end,
 })
 vim.api.nvim_create_autocmd("VimResized", {

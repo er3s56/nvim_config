@@ -247,8 +247,8 @@ function M.setup()
       if activity and activity._over_panel and activity._over_panel(mouse) then
         return ""
       end
-      local scrollbar = package.loaded["config.picker_scrollbar"]
-      if scrollbar and scrollbar._over_terminal and scrollbar._over_terminal(mouse) then
+      local terminal = package.loaded["config.terminal_tabs"]
+      if terminal and terminal.owns_window and terminal.owns_window(mouse.winid) then
         return ""
       end
       return key

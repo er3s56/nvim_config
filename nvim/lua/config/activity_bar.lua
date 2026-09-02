@@ -1565,24 +1565,6 @@ end
 -- the following tick as an explicit fallback: depending on the source mode
 -- and a concurrent panel reflow, the native click can otherwise focus the
 -- terminal window while leaving it in Normal mode.
-function M._queue_terminal_insert(mouse)
-  local win = mouse and tonumber(mouse.winid) or nil
-  if not win or win < 1 or not valid_win(win) then
-    return false
-  end
-  local buf = vim.api.nvim_win_get_buf(win)
-  if not vim.api.nvim_buf_is_valid(buf) or vim.bo[buf].buftype ~= "terminal" then
-    return false
-  end
-  vim.schedule(function()
-    if valid_win(win) and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_win_get_buf(win) == buf then
-      vim.api.nvim_set_current_win(win)
-      vim.cmd.startinsert()
-    end
-  end)
-  return true
-end
-
 function M.setup()
   if setup_done then
     return
@@ -1592,6 +1574,7 @@ function M.setup()
   vim.keymap.set({ "n", "x", "i", "t" }, "<LeftMouse>", function()
     local mouse = vim.fn.getmousepos()
     M._note_press(mouse)
+    TerminalTabs.note_press()
     -- A press outside an open menu dismisses it and does nothing else. This
     -- has to come first: the handlers below swallow presses over their own
     -- panels, and a swallowed press would leave the menu on screen.
@@ -1608,7 +1591,12 @@ function M.setup()
     if M._handle_list_click(mouse) then
       return ""
     end
-    M._queue_terminal_insert(mouse)
+    -- Let a press in the terminal leave Terminal-Insert first, so the click
+    -- positions the cursor and a drag anchors where it was aimed. Typing
+    -- resumes on the release, once it is clear nothing was selected.
+    if TerminalTabs.press_needs_normal(mouse and mouse.winid) then
+      return "<C-\\><C-n><LeftMouse>"
+    end
     return "<LeftMouse>"
   end, {
     expr = true,
@@ -1643,14 +1631,23 @@ function M.setup()
       if border_gesture then
         return key
       end
+      -- A selection dragged out in the terminal is finished on the release:
+      -- copied, and the terminal handed back to typing.
+      if key == "<LeftRelease>" then
+        TerminalTabs.note_release()
+      end
+      if key == "<LeftRelease>" and TerminalTabs.pending_selection() then
+        vim.schedule(TerminalTabs.copy_selection)
+        return ""
+      end
+      if key == "<LeftRelease>" and TerminalTabs.resume_typing() then
+        return ""
+      end
       local scrollbar = package.loaded["config.picker_scrollbar"]
       if scrollbar and consume(scrollbar, mouse) then
         return ""
       end
       if M._over_panel(mouse) then
-        return ""
-      end
-      if scrollbar and scrollbar._over_terminal and scrollbar._over_terminal(mouse) then
         return ""
       end
       return key
@@ -1678,11 +1675,13 @@ function M.setup()
       if M._over_panel(mouse) then
         return ""
       end
-      -- The project terminal is not an Activity Bar panel, but selecting its
-      -- rendered output is just as meaningless and drops it out of Terminal
-      -- mode.
-      local scrollbar = package.loaded["config.picker_scrollbar"]
-      if scrollbar and scrollbar._over_terminal and scrollbar._over_terminal(mouse) then
+      -- A double or triple click selects a word or a line, and in the terminal
+      -- that selection is meant for the clipboard like any other.
+      if lhs:find("Release", 1, true) then
+        TerminalTabs.note_release()
+      end
+      if lhs:find("Release", 1, true) and TerminalTabs.pending_selection() then
+        vim.schedule(TerminalTabs.copy_selection)
         return ""
       end
       return lhs

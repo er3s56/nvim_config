@@ -719,6 +719,102 @@ function M.owns_buffer(buf)
   return item ~= nil and item.buf == buf, group and group.root or nil
 end
 
+function M.owns_window(win)
+  win = tonumber(win)
+  if not win or win < 1 or not vim.api.nvim_win_is_valid(win) then
+    return false
+  end
+  return (M.owns_buffer(vim.api.nvim_win_get_buf(win)))
+end
+
+-- A press has to land where it was aimed. In Terminal-Insert the cursor
+-- belongs to the shell: it sits at the prompt and a click does not move it, so
+-- a drag started there anchors at the prompt and selects backwards to wherever
+-- the pointer went -- never the text that was actually pointed at. Leaving
+-- that mode first lets the click position the cursor, which is what a
+-- selection anchors to.
+-- Entering Terminal-Insert pulls the cursor to the prompt, so nothing may do
+-- it between a press and its release: that is where a drag lives, and its
+-- anchor is the cursor. Focus that arrives without the mouse still enters it
+-- at once; focus that arrives with the mouse waits for the release, which
+-- knows whether anything was selected.
+local button_down = false
+
+function M.note_press()
+  button_down = true
+end
+
+function M.note_release()
+  button_down = false
+end
+
+function M.button_down()
+  return button_down
+end
+
+function M.press_needs_normal(win)
+  return M.owns_window(win) and vim.api.nvim_get_mode().mode == "t"
+end
+
+-- And a press that turns out to be a plain click has to end back in the mode
+-- the terminal is typed in. That waits for the release: doing it on the press
+-- would drag the cursor back to the prompt mid-gesture, which is the whole
+-- problem above.
+function M.resume_typing(win)
+  win = tonumber(win) or vim.api.nvim_get_current_win()
+  if not M.owns_window(win) or vim.api.nvim_get_mode().mode ~= "nt" then
+    return false
+  end
+  local buf = vim.api.nvim_win_get_buf(win)
+  vim.schedule(function()
+    if
+      vim.api.nvim_win_is_valid(win)
+      and vim.api.nvim_buf_is_valid(buf)
+      and vim.api.nvim_win_get_buf(win) == buf
+      and vim.api.nvim_get_mode().mode == "nt"
+    then
+      vim.api.nvim_set_current_win(win)
+      pcall(vim.cmd.startinsert)
+    end
+  end)
+  return true
+end
+
+-- Selecting with the mouse is how a terminal gets read, and the point of a
+-- selection is the clipboard. Neovim stops halfway: a drag leaves a Visual
+-- selection behind that has to be yanked by hand. Finish the gesture the way
+-- every terminal emulator does -- copy it on release -- and leave the
+-- selection standing, so what was taken is still visible and can be adjusted
+-- or extended. The next click clears it and hands the terminal back to
+-- typing, which is the same gesture a terminal emulator dismisses one with.
+function M.pending_selection()
+  local mode = vim.api.nvim_get_mode().mode
+  if mode ~= "v" and mode ~= "V" and mode ~= "\22" then
+    return false
+  end
+  return (M.owns_buffer(vim.api.nvim_get_current_buf()))
+end
+
+function M.copy_selection()
+  if not M.pending_selection() then
+    return false
+  end
+  local win = vim.api.nvim_get_current_win()
+  -- `"+y` needs a clipboard provider. Without one the yank still has to
+  -- happen: the unnamed register is a poor clipboard but a better outcome
+  -- than an error that leaves the selection nowhere at all.
+  if not pcall(vim.cmd, 'normal! "+y') then
+    pcall(vim.cmd, "normal! y")
+  end
+  -- The yank ended the selection; put it back. Nothing else in the panel
+  -- leaves a mode standing, but here it is the whole point: a selection that
+  -- vanishes the instant it is taken cannot be checked or corrected.
+  if vim.api.nvim_win_is_valid(win) and M.owns_window(win) then
+    pcall(vim.cmd, "normal! gv")
+  end
+  return true
+end
+
 local function clickable(id, highlight, text)
   return ("%%#%s#%%%d@v:lua.TerminalTabsClick@%s%%T"):format(highlight, id, status_escape(text))
 end
