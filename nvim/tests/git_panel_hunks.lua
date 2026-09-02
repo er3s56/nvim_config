@@ -199,6 +199,102 @@ local ok, test_error = pcall(function()
     return vim.fn.readfile(file)[7] == "seven"
   end, "the hunk was never discarded")
   assert(vim.fn.readfile(file)[2] == "TWO", "discarding one hunk reverted the staged one as well")
+
+  -- ── the working-tree side is the file, and can be edited ──────────────
+  -- Start from a diff of its own: what the hunk tests above left behind is
+  -- their business, not this one's.
+  -- Through the buffer, not behind its back: the diff above left this file's
+  -- buffer open, and it is the file. (Writing underneath it is what the
+  -- directory watcher is for, but that is set up from VeryLazy, which a
+  -- headless run never reaches.)
+  local edited_lines = { "one", "two", "THREE", "four", "five", "six", "seven", "eight" }
+  local existing = vim.fn.bufnr(file)
+  if existing > 0 and vim.api.nvim_buf_is_loaded(existing) then
+    vim.api.nvim_buf_call(existing, function()
+      -- The hunk discarded above wrote this file underneath its buffer, and
+      -- writing over that asks a blocking question. In a session the watcher
+      -- has already reloaded it; a headless run has to say so itself.
+      vim.cmd("silent! edit!")
+      vim.api.nvim_buf_set_lines(existing, 0, -1, false, edited_lines)
+      vim.cmd("silent write")
+    end)
+  else
+    assert(vim.fn.writefile(edited_lines, file) == 0)
+  end
+  GitPanel.refresh(panel.buf, { status_only = true })
+  wait_for(function()
+    return row_of(panel, relative) ~= nil
+  end, "the edited file did not come back as a change")
+  -- The unstaged row specifically: a partly staged file has one in each
+  -- group, and only the working-tree one is the file.
+  local unstaged_row
+  for line, entry in pairs(panel.entries or {}) do
+    if entry.kind == "worktree_file" and entry.path == relative and entry.group == "changes" then
+      unstaged_row = line
+    end
+  end
+  assert(unstaged_row, "the edited file has no row in CHANGES")
+  vim.api.nvim_set_current_win(panel.win)
+  vim.api.nvim_win_set_cursor(panel.win, { unstaged_row, 0 })
+  vim.fn.maparg("<CR>", "n", false, true).callback()
+  wait_for(function()
+    return panel.preview ~= nil and panel.preview.entry.path == relative and panel.preview_layout ~= nil
+  end, "the diff did not reopen")
+
+  local after_buf = panel.preview.bufs[2]
+  assert(panel.preview.after_is_file, "the working-tree side of the diff is not the file itself")
+  assert(vim.api.nvim_buf_get_name(after_buf) == vim.fs.normalize(file), "the diff opened some other file")
+  assert(vim.bo[after_buf].buftype == "", "the file is not an ordinary buffer inside the diff")
+  assert(vim.bo[after_buf].modifiable, "the file cannot be edited inside the diff")
+  assert(next(panel.preview.hunk_marks or {}) ~= nil, "the diff has no hunks to begin with")
+
+  -- Clicking into the editable side is not navigating away from the diff.
+  -- Entering any other buffer in one of these windows collapses the layout,
+  -- and the file is not any other buffer: it is half of what is on screen.
+  vim.api.nvim_set_current_win(panel.preview_layout.after_win)
+  vim.wait(300)
+  assert(panel.preview_layout ~= nil, "focusing the editable side closed the diff")
+  assert(
+    vim.api.nvim_win_is_valid(panel.preview_layout.main_win),
+    "focusing the editable side closed the window beside it"
+  )
+
+  -- A diff binds no keys of its own. Both sides keep Vim's: on the editable
+  -- one `a`, `u` and `x` are append, undo and delete, and on the other they
+  -- are whatever Vim says they are. What acts on a hunk is the button, the
+  -- right-click menu, or gitsigns' own mappings, which work here because this
+  -- is an ordinary file buffer.
+  for _, side in ipairs(panel.preview.bufs) do
+    local bound = {}
+    for _, map in ipairs(vim.api.nvim_buf_get_keymap(side, "n")) do
+      bound[map.lhs] = map.desc or ""
+    end
+    for _, key in ipairs({ "a", "u", "x", "i", "o", "p", "d" }) do
+      assert(not bound[key], ("the diff bound `%s` (%s), which belongs to Vim"):format(key, bound[key]))
+    end
+  end
+
+  -- Unsaved changes take the hunk buttons away: they are drawn against what
+  -- is on disk, and what is on screen is no longer that. (The event that
+  -- notices is BufModifiedSet, which a headless run never delivers -- no main
+  -- loop -- so the rule is exercised through the refresh that recomputes it.)
+  vim.api.nvim_buf_set_lines(after_buf, 0, 1, false, { "ONE edited inside the diff" })
+  assert(vim.bo[after_buf].modified, "the edit did not mark the buffer unsaved")
+  GitPanel.refresh(panel.buf, { status_only = true })
+  wait_for(function()
+    return next(panel.preview.hunk_marks or {}) == nil
+  end, "an unsaved buffer kept hunk buttons that could not work")
+
+  -- Saving is what the panel is waiting for: nothing else would tell it, since
+  -- writing a file does not touch `.git`.
+  vim.api.nvim_buf_call(after_buf, function()
+    vim.cmd("silent write")
+  end)
+  wait_for(function()
+    return next(panel.preview.hunk_marks or {}) ~= nil
+  end, "saving the file did not bring the hunk buttons back")
+  assert(vim.fn.readfile(file)[1] == "ONE edited inside the diff", "the edit did not reach the file")
+  assert(not vim.bo[after_buf].modified, "the buffer is still unsaved after being written")
 end)
 
 pcall(ActivityBar.close)

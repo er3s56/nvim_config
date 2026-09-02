@@ -143,8 +143,15 @@ local ok, test_error = pcall(function()
     "Enter did not open the Git diff layout"
   )
 
+  -- The working-tree side of a diff is the file itself, so its tab is the
+  -- file's. The side that is a snapshot of the index keeps the panel's own
+  -- name, and that name is not proactively shortened.
+  assert(state.preview.after_is_file, "the working-tree side of the diff is not the file")
   local after_name = vim.api.nvim_buf_get_name(state.preview.bufs[2])
-  assert(after_name:find("src›deep›file.txt", 1, true), "diff tab label proactively shortened the path")
+  assert(after_name == vim.fs.normalize(file), "the diff's editable side is not the file it describes")
+  assert(vim.bo[state.preview.bufs[2]].modifiable, "the working-tree side of the diff cannot be edited")
+  local before_name = vim.api.nvim_buf_get_name(state.preview.bufs[1])
+  assert(before_name:find("src›deep›file.txt", 1, true), "diff tab label proactively shortened the path")
   local diff_window_count = #vim.api.nvim_tabpage_list_wins(0)
   local preview = state.preview
   local old_after_win = state.preview_layout.after_win
@@ -160,7 +167,17 @@ local ok, test_error = pcall(function()
   assert(vim.api.nvim_get_current_win() == state.editor_win, "workspace file did not focus the central editor")
   assert(vim.api.nvim_buf_get_name(0) == file, "central editor opened the wrong workspace path")
 
+  -- The working-tree side is the file, so its tab is the file's: asking for
+  -- that buffer opens the file, not the diff it happens to be half of.
   GitPanel.open_buffer(preview.bufs[2])
+  vim.wait(400)
+  assert(state.preview_layout == nil, "opening the file reopened the diff around it")
+  assert(vim.api.nvim_buf_get_name(0) == file, "opening the file showed something else")
+
+  -- The diff comes back the way it was opened, and comes back the same shape.
+  vim.api.nvim_set_current_win(state.win)
+  vim.api.nvim_win_set_cursor(state.win, { row, 0 })
+  vim.fn.maparg("<CR>", "n", false, true).callback()
   assert(
     vim.wait(3000, function()
       return state.preview_layout and vim.api.nvim_win_is_valid(state.preview_layout.after_win)

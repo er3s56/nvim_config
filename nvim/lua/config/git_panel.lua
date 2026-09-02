@@ -77,6 +77,18 @@ local function notify_error(message)
   end
 end
 
+local function workspace_path(state, entry)
+  if not (state and state.root and entry and entry.path) then
+    return
+  end
+  return vim.fs.normalize(vim.fs.joinpath(state.root, entry.path))
+end
+
+local function workspace_file_exists(path)
+  local stat = path and vim.uv.fs_stat(path) or nil
+  return stat ~= nil and stat.type == "file"
+end
+
 local function display_path(path, width)
   local text = (path or ""):gsub("[\r\n]", " ")
   width = math.max(width or 0, 0)
@@ -1071,7 +1083,29 @@ local function valid_preview(preview)
     and vim.api.nvim_buf_is_valid(preview.bufs[2])
 end
 
+-- Buffers the panel made, which it may replace or discard at will. The
+-- working-tree side is excluded everywhere: it belongs to the reader, and
+-- treating it as scratch would restore a blank buffer over their file.
+local function preview_owns_buffer(preview, buf)
+  if preview.bufs[1] == buf then
+    return true
+  end
+  return preview.bufs[2] == buf and not preview.after_is_file
+end
+
 local function preview_containing_buffer(state, buf)
+  for _, preview in pairs(state.previews or {}) do
+    if valid_preview(preview) and preview_owns_buffer(preview, buf) then
+      return preview
+    end
+  end
+end
+
+-- Whether a buffer is one of the two a preview is showing, whoever owns it.
+-- Ownership answers what may be deleted or written over; this answers whether
+-- the reader is still looking at the diff, which the file-backed side very
+-- much is -- entering it must not be mistaken for navigating away from it.
+local function preview_showing_buffer(state, buf)
   for _, preview in pairs(state.previews or {}) do
     if valid_preview(preview) and vim.tbl_contains(preview.bufs, buf) then
       return preview
@@ -1079,9 +1113,12 @@ local function preview_containing_buffer(state, buf)
   end
 end
 
+-- The preview a buffer *is*, for the paths that reopen a diff when its buffer
+-- comes back. A file-backed side is not one of those: opening a file has to
+-- mean opening the file, whether or not a diff of it happens to be cached.
 local function preview_for_buffer(state, buf)
   for _, preview in pairs(state.previews or {}) do
-    if valid_preview(preview) and preview.bufs[2] == buf then
+    if valid_preview(preview) and preview.bufs[2] == buf and not preview.after_is_file then
       return preview
     end
   end
@@ -1218,8 +1255,19 @@ local function delete_preview(state, preview)
   if state.previews then
     state.previews[preview.key] = nil
   end
-  for _, buf in ipairs(preview.bufs or {}) do
-    if vim.api.nvim_buf_is_valid(buf) then
+  for index, buf in ipairs(preview.bufs or {}) do
+    local ours = true
+    if index == 2 and preview.after_is_file then
+      -- The working-tree side is a real file. A buffer opened for this diff
+      -- and left untouched goes with it, so a closed diff leaves no tab
+      -- behind; one the reader already had, or has edited, or is still
+      -- looking at somewhere else, is none of the panel's business.
+      ours = preview.after_buf_ours == true
+        and vim.api.nvim_buf_is_valid(buf)
+        and not vim.bo[buf].modified
+        and #vim.fn.win_findbuf(buf) == 0
+    end
+    if ours and vim.api.nvim_buf_is_valid(buf) then
       pcall(vim.api.nvim_buf_delete, buf, { force = true })
     end
   end
@@ -1791,6 +1839,13 @@ local function prepare_hunks(preview)
   if preview.skipped then
     return
   end
+  -- Nor while the file has unsaved changes. The hunks are computed from what
+  -- is on disk, git can only stage what is on disk, and the lines on screen
+  -- are neither -- buttons drawn against them would point at the wrong text
+  -- and refuse when pressed.
+  if preview.after_is_file and vim.bo[preview.bufs[2]].modified then
+    return
+  end
   if GitOps.is_binary(preview.before) or GitOps.is_binary(preview.after) then
     return
   end
@@ -1880,7 +1935,25 @@ local function show_preview(state, entry, key, before, after, specs, focus_previ
   local before_name = ("git-preview://%d/%d/before/%s"):format(state.buf, serial, path_label)
   local after_name = ("git-diff://%d/%d/%s"):format(state.buf, serial, tab_label)
   local before_buf = preview_buffer(false, before_name, entry.old_path or entry.path, before, specs.skipped)
-  local after_buf = preview_buffer(true, after_name, entry.path, after, specs.skipped)
+  -- The working-tree side is the file, not a copy of it. That is what makes
+  -- the diff editable: what is on the right is the buffer the editor would
+  -- have opened, so it can be changed, written, and undone like any other.
+  -- Every other side is a snapshot of something that is not a file -- the
+  -- index, a commit -- and stays a scratch buffer.
+  local after_buf, after_is_file, after_buf_ours
+  local worktree = specs.after_worktree and not specs.skipped and workspace_path(state, entry) or nil
+  if worktree and workspace_file_exists(worktree) then
+    -- Whether the reader already had this file open decides who cleans it up.
+    after_buf_ours = vim.fn.bufexists(worktree) == 0
+    after_buf = vim.fn.bufadd(worktree)
+    local loaded = pcall(vim.fn.bufload, after_buf)
+    after_is_file = loaded and vim.api.nvim_buf_is_valid(after_buf)
+  end
+  if after_is_file then
+    vim.bo[after_buf].buflisted = true
+  else
+    after_buf = preview_buffer(true, after_name, entry.path, after, specs.skipped)
+  end
   local preview = {
     key = key,
     entry = entry,
@@ -1888,6 +1961,8 @@ local function show_preview(state, entry, key, before, after, specs, focus_previ
     views = {},
     mode = specs.mode,
     skipped = specs.skipped,
+    after_is_file = after_is_file,
+    after_buf_ours = after_is_file and after_buf_ours or nil,
     before = before,
     after = after,
     before_label = specs.before_label,
@@ -1916,16 +1991,40 @@ local function show_preview(state, entry, key, before, after, specs, focus_previ
       silent = true,
       desc = "Scroll both Git diff windows up",
     })
-    for _, item in ipairs({
-      { key = "a", action = "stage", desc = "Stage the hunk under the cursor" },
-      { key = "u", action = "unstage", desc = "Unstage the hunk under the cursor" },
-      { key = "x", action = "discard", desc = "Discard the hunk under the cursor" },
-    }) do
-      vim.keymap.set("n", item.key, function()
-        M._hunk_action_at_cursor(item.action)
-      end, { buffer = buf, silent = true, desc = item.desc })
-    end
   end
+
+  if after_is_file then
+    -- The working tree changed without `.git` changing, so nothing else would
+    -- notice: the watcher only sees the repository. Refreshing re-reads the
+    -- diff, which brings the hunk buttons back with the saved lines under
+    -- them.
+    vim.api.nvim_create_autocmd("BufWritePost", {
+      buffer = after_buf,
+      callback = function()
+        if valid(state) then
+          M.refresh(state.buf, { status_only = true })
+        end
+      end,
+    })
+    -- Whether the buttons belong on screen changes with the file: they are
+    -- drawn against what is on disk, and an unsaved edit means what is on
+    -- screen is no longer that. `BufModifiedSet` is the event for exactly
+    -- this. Anything it misses corrects itself at the next refresh, which
+    -- recomputes the hunks from scratch.
+    vim.api.nvim_create_autocmd("BufModifiedSet", {
+      buffer = after_buf,
+      callback = function()
+        -- The preview itself, not a lookup by key: a preview is re-keyed when
+        -- the file's status changes, and by then the key this closure was
+        -- built with finds nothing.
+        if valid(state) and valid_preview(preview) and state.previews[preview.key] == preview then
+          prepare_hunks(preview)
+          render_hunk_buttons(state, preview)
+        end
+      end,
+    })
+  end
+
   vim.api.nvim_create_autocmd({ "BufDelete", "BufWipeout" }, {
     once = true,
     buffer = after_buf,
@@ -2131,7 +2230,15 @@ function reload_preview(state, preview, entry)
       return notify_error(err)
     end
     before, after = before or "", after or ""
-    local changed = preview.before ~= before or preview.after ~= after or preview.mode ~= specs.mode
+    -- Whether the file has unsaved edits is part of what the diff is showing:
+    -- the hunk buttons come and go with it, and nothing about the content on
+    -- disk has to change for that to be true.
+    local modified = preview.after_is_file and vim.bo[preview.bufs[2]].modified == true or false
+    local changed = preview.before ~= before
+      or preview.after ~= after
+      or preview.mode ~= specs.mode
+      or preview.drawn_modified ~= modified
+    preview.drawn_modified = modified
     preview.entry = entry
     preview.mode = specs.mode
     preview.skipped = specs.skipped
@@ -2141,7 +2248,12 @@ function reload_preview(state, preview, entry)
       return
     end
     set_preview_content(preview.bufs[1], entry.old_path or entry.path, before, specs.skipped)
-    set_preview_content(preview.bufs[2], entry.path, after, specs.skipped)
+    -- Never the working-tree side when it is the file itself: it may hold
+    -- edits that have not been written, and Neovim re-diffs it as they are
+    -- typed anyway.
+    if not preview.after_is_file then
+      set_preview_content(preview.bufs[2], entry.path, after, specs.skipped)
+    end
     prepare_hunks(preview)
     render_hunk_buttons(state, preview)
     local layout = state.preview_layout
@@ -2579,17 +2691,6 @@ function M._handle_preview_click(mouse)
   return true
 end
 
--- The same three actions from the keyboard, on the hunk under the cursor.
-function M._hunk_action_at_cursor(name)
-  local win = vim.api.nvim_get_current_win()
-  local state, preview, side = preview_at_window(win)
-  if not state then
-    return
-  end
-  local line = vim.api.nvim_win_get_cursor(win)[1]
-  activate_hunk_action(state, preview, name, GitOps.hunk_at(preview.hunks or {}, side, line))
-end
-
 -- ── the hovered row ─────────────────────────────────────────────────────
 
 local function panel_at_window(win)
@@ -2653,18 +2754,6 @@ local function sync_hover_events()
     vim.o.mousemoveevent = hover_events_original
     hover_events_original = nil
   end
-end
-
-local function workspace_path(state, entry)
-  if not (state and state.root and entry and entry.path) then
-    return
-  end
-  return vim.fs.normalize(vim.fs.joinpath(state.root, entry.path))
-end
-
-local function workspace_file_exists(path)
-  local stat = path and vim.uv.fs_stat(path) or nil
-  return stat ~= nil and stat.type == "file"
 end
 
 local function notify_missing_workspace_file(entry)
@@ -3975,7 +4064,7 @@ vim.api.nvim_create_autocmd("BufEnter", {
               end
             end)
           end
-        elseif not preview_containing_buffer(state, event.buf) then
+        elseif not preview_showing_buffer(state, event.buf) then
           local layout = state.preview_layout
           if
             layout
