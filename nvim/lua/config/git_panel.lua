@@ -1,3 +1,4 @@
+local BinaryFiles = require("config.binary_files")
 local ContextMenu = require("config.context_menu")
 local GitOps = require("config.git_ops")
 local PanelLayout = require("config.panel_layout")
@@ -1242,7 +1243,10 @@ local function close_preview(state)
   end
 end
 
-local function content_lines(content)
+local function content_lines(content, skipped)
+  if skipped then
+    return { skipped }
+  end
   if content:find("\0", 1, true) then
     return { "Binary file — textual preview is unavailable." }
   end
@@ -1254,14 +1258,14 @@ local function content_lines(content)
   return #lines > 0 and lines or { "" }
 end
 
-local function set_preview_content(buf, path, content)
+local function set_preview_content(buf, path, content, skipped)
   vim.bo[buf].modifiable = true
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, content_lines(content))
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, content_lines(content, skipped))
   vim.bo[buf].modifiable = false
   vim.bo[buf].filetype = vim.filetype.match({ filename = path }) or ""
 end
 
-local function update_preview_buffer(buf, name, path, content)
+local function update_preview_buffer(buf, name, path, content, skipped)
   vim.api.nvim_buf_set_name(buf, name)
   vim.bo[buf].buftype = "nofile"
   vim.bo[buf].bufhidden = "hide"
@@ -1270,12 +1274,12 @@ local function update_preview_buffer(buf, name, path, content)
   -- Keep Snacks Explorer from treating this nofile buffer as a missing main
   -- editor and selecting the Git panel or terminal as its replacement.
   vim.b[buf].snacks_main = true
-  set_preview_content(buf, path, content)
+  set_preview_content(buf, path, content, skipped)
 end
 
-local function preview_buffer(listed, name, path, content)
+local function preview_buffer(listed, name, path, content, skipped)
   local buf = vim.api.nvim_create_buf(listed, true)
-  update_preview_buffer(buf, name, path, content)
+  update_preview_buffer(buf, name, path, content, skipped)
   return buf
 end
 
@@ -1782,6 +1786,11 @@ local function prepare_hunks(preview)
   if #hunk_actions(preview.mode) == 0 then
     return
   end
+  -- A side that was never read has no lines to stage: what is in the buffer
+  -- is a sentence about the file, not the file.
+  if preview.skipped then
+    return
+  end
   if GitOps.is_binary(preview.before) or GitOps.is_binary(preview.after) then
     return
   end
@@ -1870,14 +1879,15 @@ local function show_preview(state, entry, key, before, after, specs, focus_previ
   local tab_label = ("Δ %s · %s"):format(path_label, source)
   local before_name = ("git-preview://%d/%d/before/%s"):format(state.buf, serial, path_label)
   local after_name = ("git-diff://%d/%d/%s"):format(state.buf, serial, tab_label)
-  local before_buf = preview_buffer(false, before_name, entry.old_path or entry.path, before)
-  local after_buf = preview_buffer(true, after_name, entry.path, after)
+  local before_buf = preview_buffer(false, before_name, entry.old_path or entry.path, before, specs.skipped)
+  local after_buf = preview_buffer(true, after_name, entry.path, after, specs.skipped)
   local preview = {
     key = key,
     entry = entry,
     bufs = { before_buf, after_buf },
     views = {},
     mode = specs.mode,
+    skipped = specs.skipped,
     before = before,
     after = after,
     before_label = specs.before_label,
@@ -1931,8 +1941,28 @@ local function show_preview(state, entry, key, before, after, specs, focus_previ
   activate_preview(state, preview, focus_preview)
 end
 
+-- A diff holds both sides in memory, side by side, in windows that redraw
+-- together. What is too big for one buffer is far too big for two, so the
+-- panel draws the line well before the editor does.
+local PREVIEW_LIMIT = 5 * 1024 * 1024
+
+local function unshowable(reason, size)
+  return ("%s · %s"):format(
+    reason == "large" and "Too large to show" or "Binary file",
+    BinaryFiles.human(size or 0)
+  )
+end
+
 local function read_worktree(root, path, callback)
-  run({ "cat", "--", vim.fs.joinpath(root, path) }, callback, false)
+  local full = vim.fs.joinpath(root, path)
+  local reason, stat = BinaryFiles.reason(full, { limit = PREVIEW_LIMIT })
+  if reason then
+    -- Not read at all: the whole point is to never hold it.
+    return vim.schedule(function()
+      callback("", 0, "", unshowable(reason, stat and stat.size))
+    end)
+  end
+  run({ "cat", "--", full }, callback, false)
 end
 
 local function read_blob(root, spec, callback)
@@ -1942,7 +1972,15 @@ local function read_blob(root, spec, callback)
     end)
     return
   end
-  run_git(root, { "show", spec }, callback, false)
+  -- `cat-file -s` answers the size without producing the object, which is the
+  -- difference between a diff that opens and one that hangs.
+  run_git(root, { "cat-file", "-s", spec }, function(output, code)
+    local size = tonumber(vim.trim(output or ""))
+    if code == 0 and size and size > PREVIEW_LIMIT then
+      return callback("", 0, "", unshowable("large", size))
+    end
+    run_git(root, { "show", spec }, callback, false)
+  end)
 end
 
 -- What a row's diff compares, and what that makes it: an edit still in flight
@@ -1996,15 +2034,16 @@ end
 -- error -- a file that was added has no previous version -- but a side git
 -- refuses to produce is, and the caller is told which one.
 local function read_sides(root, path, specs, callback)
-  local before, after, failure
+  local before, after, failure, skipped
   local before_done, after_done = false, false
   local function finish()
     if before_done and after_done then
-      callback(before, after, failure)
+      callback(before, after, failure, skipped)
     end
   end
   local function receive(side)
-    return function(output, code, stderr)
+    return function(output, code, stderr, unshown)
+      skipped = skipped or unshown
       if code ~= 0 and not failure then
         local detail = vim.trim(stderr or "")
         failure = ("Git could not read `%s` (%s, exit %s)%s"):format(
@@ -2059,10 +2098,11 @@ local function open_file_preview(state, entry, focus_preview)
   state.preview_request_focus = focus_preview
   local specs = preview_specs(entry)
 
-  read_sides(state.root, entry.path, specs, function(before, after, err)
+  read_sides(state.root, entry.path, specs, function(before, after, err, skipped)
     if not valid(state) or state.preview_generation ~= generation then
       return
     end
+    specs.skipped = skipped
     local should_focus = state.preview_request_focus
     state.preview_request_key = nil
     state.preview_request_focus = nil
@@ -2082,10 +2122,11 @@ function reload_preview(state, preview, entry)
   local specs = preview_specs(entry)
   preview.reload_serial = (preview.reload_serial or 0) + 1
   local serial = preview.reload_serial
-  read_sides(state.root, entry.path, specs, function(before, after, err)
+  read_sides(state.root, entry.path, specs, function(before, after, err, skipped)
     if not valid(state) or not valid_preview(preview) or preview.reload_serial ~= serial then
       return
     end
+    specs.skipped = skipped
     if err then
       return notify_error(err)
     end
@@ -2093,13 +2134,14 @@ function reload_preview(state, preview, entry)
     local changed = preview.before ~= before or preview.after ~= after or preview.mode ~= specs.mode
     preview.entry = entry
     preview.mode = specs.mode
+    preview.skipped = specs.skipped
     preview.before, preview.after = before, after
     preview.before_label, preview.after_label = specs.before_label, specs.after_label
     if not changed then
       return
     end
-    set_preview_content(preview.bufs[1], entry.old_path or entry.path, before)
-    set_preview_content(preview.bufs[2], entry.path, after)
+    set_preview_content(preview.bufs[1], entry.old_path or entry.path, before, specs.skipped)
+    set_preview_content(preview.bufs[2], entry.path, after, specs.skipped)
     prepare_hunks(preview)
     render_hunk_buttons(state, preview)
     local layout = state.preview_layout

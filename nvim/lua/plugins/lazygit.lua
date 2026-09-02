@@ -10,6 +10,7 @@ return {
   {
     "folke/snacks.nvim",
     init = function()
+      require("config.binary_files").setup()
       require("config.explorer_menu").setup()
       require("config.picker_finder").setup()
       require("config.picker_scrollbar").setup()
