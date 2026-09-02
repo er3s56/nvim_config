@@ -39,8 +39,14 @@ local render_state = {
   win = panel_win,
   branch = "test",
   changes = { { kind = "worktree_file", group = "changes", letter = "M", status = " M", path = short_path } },
-  commits = { { kind = "commit", full_hash = commit_hash, hash = "aaaaaaa", subject = "subject" } },
-  collapsed = { merge = false, staged = false, changes = false, commits = false },
+  branches = { { ref = "test", current = true, track = "" } },
+  commit_lists = {
+    test = {
+      commits = { { kind = "commit", ref = "test", full_hash = commit_hash, hash = "aaaaaaa", subject = "subject" } },
+      exhausted = true,
+    },
+  },
+  collapsed = { merge = false, staged = false, changes = false, branches = false, ["branch:test"] = false },
   expanded = { [commit_hash] = true },
   commit_files = {
     [commit_hash] = {
@@ -52,7 +58,14 @@ GitPanel._render(render_state)
 local rendered = vim.api.nvim_buf_get_lines(panel_buf, 0, -1, false)
 assert(rendered[4]:find("CHANGES", 1, true), "an empty STAGED CHANGES group took up a row of its own")
 assert(rendered[5]:find(short_path, 1, true), "CHANGES path was proactively abbreviated")
-assert(rendered[9]:find("lua/config/module.lua", 1, true), "expanded commit path was proactively abbreviated")
+-- The commit lives under its branch now, one fold deeper than before.
+local expanded_line
+for index, text in ipairs(rendered) do
+  if text:find("lua/config/module.lua", 1, true) then
+    expanded_line = index
+  end
+end
+assert(expanded_line, "expanded commit path was proactively abbreviated:\n" .. table.concat(rendered, "\n"))
 
 local root = vim.fn.tempname()
 local renamed_path = "new/location/file.txt"

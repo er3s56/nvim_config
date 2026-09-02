@@ -67,8 +67,11 @@ vim.wait(2000)
 ActivityBar.open("git", { focus = false })
 assert(
   vim.wait(10000, function()
+    -- The checked-out branch is the one that opens itself, so its history is
+    -- what has to have arrived before the report can name any of this.
     local state = GitPanel.current()
-    return state ~= nil and state.changes ~= nil and #state.commits > 0
+    local list = state and state.branch and state.commit_lists[state.branch]
+    return state ~= nil and state.changes ~= nil and list ~= nil and #(list.commits or {}) > 0
   end),
   "the Git panel never loaded"
 )
@@ -76,7 +79,7 @@ vim.wait(1000)
 
 local live = report()
 has(live, "view=git", "the report did not name the open view")
-has(live, "1 change row(s), 1 commit(s)", "the report did not reflect the repository state")
+has(live, "1 change row(s), 1 branch(es), 1 commit(s)", "the report did not reflect the repository state")
 has(live, ".git watcher(s) running", "the running Git watcher was not reported")
 has(live, "every registered watch is running", "the file watchers were not reported healthy")
 has(live, "directory watch(es) open process-wide", "the watch total was not reported")

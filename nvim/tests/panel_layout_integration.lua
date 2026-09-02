@@ -93,7 +93,7 @@ local ok, test_error = pcall(function()
     vim.wait(3000, function()
       local current = ActivityBar.current()
       return not current.content.git_state
-        or (current.content.git_state.changes ~= nil and current.content.git_state.commits ~= nil)
+        or (current.content.git_state.changes ~= nil and current.content.git_state.branches ~= nil)
     end),
     "Git sidebar did not finish loading"
   )

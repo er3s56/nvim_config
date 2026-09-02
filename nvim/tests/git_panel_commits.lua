@@ -26,9 +26,21 @@ local function panel()
   return assert(GitPanel.current(), "no Git panel")
 end
 
-local function loaded()
+-- Every branch keeps its own history; this repository has one, and it is the
+-- section that opens itself.
+local function list()
   local state = GitPanel.current()
-  return state and state.commits and #state.commits or 0
+  return state and state.branch and (state.commit_lists or {})[state.branch] or nil
+end
+
+local function loaded()
+  local current = list()
+  return current and current.commits and #current.commits or 0
+end
+
+local function exhausted()
+  local current = list()
+  return current ~= nil and current.exhausted == true
 end
 
 -- `normal! G` inside nvim_win_call does not move the viewport of a window
@@ -71,7 +83,7 @@ local ok, test_error = pcall(function()
   -- then hold a line per commit.
   local first = loaded()
   assert(first == 200, ("the first batch loaded %d commits, expected 200"):format(first))
-  assert(not panel().commits_exhausted, "a truncated first batch was marked exhausted")
+  assert(not exhausted(), "a truncated first batch was marked exhausted")
   assert(load_more_line(), "the truncated list has no Load More entry")
 
   -- The list stops there. It must not keep growing on its own, whether the
@@ -97,7 +109,7 @@ local ok, test_error = pcall(function()
 
   -- With the history exhausted the entry is gone, so there is nothing left to
   -- activate and no further fetching.
-  assert(panel().commits_exhausted, "the end of the history was not detected")
+  assert(exhausted(), "the end of the history was not detected")
   assert(not load_more_line(), "the Load More entry outlived the end of the history")
   local settled = loaded()
   vim.wait(800)
@@ -106,7 +118,7 @@ local ok, test_error = pcall(function()
   -- Activity Bar destroys and rebuilds the panel on every view switch, so the
   -- expanded depth has to survive as repository state rather than panel state.
   local expanded = loaded()
-  local was_exhausted = panel().commits_exhausted
+  local was_exhausted = exhausted()
   ActivityBar.open("explorer", { focus = false })
   assert(
     vim.wait(5000, function()
@@ -124,7 +136,7 @@ local ok, test_error = pcall(function()
   vim.wait(500)
   assert(loaded() == expanded, ("switching views reset the commit list from %d to %d"):format(expanded, loaded()))
   assert(
-    panel().commits_exhausted == was_exhausted,
+    exhausted() == was_exhausted,
     "switching views lost the end-of-history state, resurrecting a dead Load More entry"
   )
   assert(not load_more_line(), "a Load More entry came back after the history was exhausted")

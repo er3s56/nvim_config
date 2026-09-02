@@ -286,15 +286,17 @@ local ok, test_error = pcall(function()
 
   -- Committing moves HEAD, so the watcher has to reload the commit list too,
   -- not just the status.
-  local before = #(panel.commits or {})
+  local list = assert(panel.commit_lists[panel.branch], "the checked-out branch has no history")
+  local before = #(list.commits or {})
   git({ "add", "-A" })
   git({ "commit", "-qm", "second" })
   assert(
     vim.wait(10000, function()
-      return #(panel.commits or {}) == before + 1 and change_count(panel) == 0
+      local current = panel.commit_lists[panel.branch]
+      return current ~= nil and #(current.commits or {}) == before + 1 and change_count(panel) == 0
     end),
     ("the Git directory watcher did not reload after a commit (commits=%d changes=%d)"):format(
-      #(panel.commits or {}),
+      #((panel.commit_lists[panel.branch] or {}).commits or {}),
       change_count(panel)
     )
   )

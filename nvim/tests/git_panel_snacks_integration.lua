@@ -1,5 +1,13 @@
 local ContextMenu = require("config.context_menu")
+
 local GitPanel = require("config.git_panel")
+
+-- Each branch keeps its own history now, and the checked-out one is the
+-- section that opens itself.
+local function current_commits(state)
+  local list = state and state.branch and (state.commit_lists or {})[state.branch]
+  return list and list.commits or nil
+end
 
 assert(rawget(_G, "Snacks") and Snacks.picker, "Snacks must be loaded by the real config")
 local bufferline_config = require("bufferline.config").get()
@@ -76,7 +84,7 @@ local ok, test_error = pcall(function()
   assert(state, "Git panel did not open")
   assert(
     vim.wait(3000, function()
-      return state.changes ~= nil and state.commits ~= nil
+      return state.changes ~= nil and current_commits(state) ~= nil
     end),
     "Git panel did not finish loading"
   )
@@ -178,7 +186,7 @@ local ok, test_error = pcall(function()
   assert(state, "Git panel did not reopen")
   assert(
     vim.wait(3000, function()
-      return state.changes ~= nil and state.commits ~= nil
+      return state.changes ~= nil and current_commits(state) ~= nil
     end),
     "reopened Git panel did not finish loading"
   )

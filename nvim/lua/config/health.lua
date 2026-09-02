@@ -183,13 +183,23 @@ local function check_git_panel()
     if not buf_valid(buf) then
       vim.health.error(("a state is keyed by buffer %s, which no longer exists"):format(buf))
     else
+      -- History is per branch now, and only the open ones have any: a count
+      -- of loaded commits means nothing without saying how many branches it
+      -- came from.
+      local loaded, open = 0, 0
+      for _, list in pairs(state.commit_lists or {}) do
+        if list.commits then
+          open = open + 1
+          loaded = loaded + #list.commits
+        end
+      end
       vim.health.info(
-        ("%s: %d change row(s), %d commit(s)%s%s"):format(
+        ("%s: %d change row(s), %d branch(es), %d commit(s) from %d open"):format(
           vim.fn.fnamemodify(state.root or "?", ":~"),
           #(state.changes or {}),
-          #(state.commits or {}),
-          state.commits_exhausted and " (whole history)" or " (more to load)",
-          state.commit_loading and ", loading" or ""
+          #(state.branches or {}),
+          loaded,
+          open
         )
       )
     end
@@ -222,13 +232,17 @@ local function check_git_panel()
   local depths = panel._commit_depths or {}
   if count(depths) > 0 then
     local parts = {}
-    for root, depth in pairs(depths) do
-      parts[#parts + 1] = ("%s=%d%s"):format(
-        vim.fn.fnamemodify(root, ":t"),
-        depth.offset or 0,
-        depth.exhausted and " (end)" or ""
-      )
+    for root, branches in pairs(depths) do
+      for ref, depth in pairs(branches) do
+        parts[#parts + 1] = ("%s@%s=%d%s"):format(
+          vim.fn.fnamemodify(root, ":t"),
+          ref,
+          depth.offset or 0,
+          depth.exhausted and " (end)" or ""
+        )
+      end
     end
+    table.sort(parts)
     vim.health.info("expanded history remembered for: " .. table.concat(parts, ", "))
   end
 end

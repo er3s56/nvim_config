@@ -13,6 +13,8 @@ local states = {}
 local load_commits
 local drop_stale_worktree_preview
 local reload_preview
+local commit_list
+
 local ns = vim.api.nvim_create_namespace("project_git_panel")
 -- The hunk buttons live in the diff buffers, which the panel does not own the
 -- highlights of, so they get a namespace that can be cleared on its own.
@@ -26,6 +28,23 @@ local git_panel_placements = {}
 -- without this a list the user grew with Load More would snap back to the
 -- first batch as soon as they looked at the Explorer and came back.
 local commit_depths = {}
+
+local function branch_key(ref)
+  return "branch:" .. ref
+end
+
+-- History is remembered per branch: growing one branch's list must not make
+-- the panel re-read every other one at that depth. Nested rather than keyed by
+-- a joined string -- a key holding a path and a refname has no separator that
+-- is safe in both, and anything with a NUL in it reaches Vim as a Blob.
+local function remembered_depth(root, ref)
+  return (commit_depths[root] or {})[ref]
+end
+
+local function remember_depth(root, ref, depth)
+  commit_depths[root] = commit_depths[root] or {}
+  commit_depths[root][ref] = depth
+end
 
 local function placement_key(root, tab)
   return root .. "\0" .. tostring(tab)
@@ -203,8 +222,8 @@ local function section_text(state, section)
     end
     return ("  %s TIMELINE  %s"):format(arrow, label)
   end
-  local label = state.commits == nil and "loading…" or tostring(#state.commits)
-  return ("  %s COMMITS  %s"):format(arrow, label)
+  local label = state.branches == nil and "loading…" or tostring(#state.branches)
+  return ("  %s BRANCHES  %s"):format(arrow, label)
 end
 
 local function row_highlight(entry)
@@ -343,52 +362,84 @@ local function render(state)
   end
 
   add("")
-  add_row({ kind = "section", section = "commits" })
-  if not state.collapsed.commits and state.commits ~= nil then
-    if #state.commits == 0 then
-      add("    No commits", "Comment")
+  add_row({ kind = "section", section = "branches" })
+  if not state.collapsed.branches then
+    if state.branches == nil then
+      add("    Loading branches…", "Comment")
+    elseif #state.branches == 0 then
+      add("    No branches", "Comment")
     end
-    for _, commit in ipairs(state.commits) do
-      local expanded = state.expanded[commit.full_hash]
+    for _, branch in ipairs(state.branches or {}) do
+      local collapsed = state.collapsed[branch_key(branch.ref)]
+      local suffix = branch.track ~= "" and ("  " .. branch.track) or ""
+      local room = math.max(width - 10 - vim.fn.strdisplaywidth(suffix), 8)
       add(
-        ("  %s %s %s"):format(
-          expanded and "▾" or "▸",
-          commit.hash,
-          truncate(commit.subject, math.max(width - 15, 10))
+        ("    %s %s %s%s"):format(
+          collapsed and "▸" or "▾",
+          branch.current and "●" or " ",
+          truncate(branch.ref, room),
+          suffix
         ),
-        nil,
-        commit
+        branch.current and "Title" or nil,
+        { kind = "branch", ref = branch.ref, current = branch.current }
       )
+      if collapsed then
+        goto continue
+      end
 
-      if expanded then
-        local cached = state.commit_files[commit.full_hash]
-        if not cached or cached.loading then
-          add("      loading changed files…", "Comment")
-        elseif cached.error then
-          add("      Failed to load changed files", "DiagnosticError")
-        elseif #cached.files == 0 then
-          add("      No changed files", "Comment")
-        else
-          for _, file in ipairs(cached.files) do
-            local prefix = ("    %-4s "):format(file.status)
-            add(
-              prefix .. display_path(file.path, math.max(width - vim.fn.strdisplaywidth(prefix), 1)),
-              status_hl(file.status),
-              file
-            )
+      local list = state.commit_lists[branch.ref]
+      if not list or list.commits == nil then
+        add("        Loading commits…", "Comment")
+      elseif #list.commits == 0 then
+        add("        No commits", "Comment")
+      end
+      for _, commit in ipairs((list or {}).commits or {}) do
+        local expanded = state.expanded[commit.full_hash]
+        add(
+          ("      %s %s %s"):format(
+            expanded and "▾" or "▸",
+            commit.hash,
+            truncate(commit.subject, math.max(width - 19, 10))
+          ),
+          nil,
+          commit
+        )
+
+        if expanded then
+          local cached = state.commit_files[commit.full_hash]
+          if not cached or cached.loading then
+            add("          loading changed files…", "Comment")
+          elseif cached.error then
+            add("          Failed to load changed files", "DiagnosticError")
+          elseif #cached.files == 0 then
+            add("          No changed files", "Comment")
+          else
+            for _, file in ipairs(cached.files) do
+              local prefix = ("        %-4s "):format(file.status)
+              add(
+                prefix .. display_path(file.path, math.max(width - vim.fn.strdisplaywidth(prefix), 1)),
+                status_hl(file.status),
+                file
+              )
+            end
           end
         end
       end
-    end
-    -- The history is loaded a batch at a time and stops there. Reaching the
-    -- end of the list is a deliberate pause with an explicit entry, rather
-    -- than history that keeps growing under the scroll.
-    if not state.commits_exhausted and #state.commits > 0 then
-      if state.commit_loading then
-        add("    Loading more commits…", "Comment", { kind = "commit_load_more", loading = true })
-      else
-        add("  ↓ Load more commits", "Function", { kind = "commit_load_more" })
+      -- The history is loaded a batch at a time and stops there. Reaching the
+      -- end of the list is a deliberate pause with an explicit entry, rather
+      -- than history that keeps growing under the scroll.
+      if list and list.commits and #list.commits > 0 and not list.exhausted then
+        if list.loading then
+          add(
+            "        Loading more commits…",
+            "Comment",
+            { kind = "commit_load_more", ref = branch.ref, loading = true }
+          )
+        else
+          add("      ↓ Load more commits", "Function", { kind = "commit_load_more", ref = branch.ref })
+        end
       end
+      ::continue::
     end
   end
 
@@ -567,34 +618,53 @@ local function parse_status(output)
 end
 
 -- Append the next slice of history, or reload the first `count` commits when
--- `reset` is set. Guarded by the same generation counter as a full refresh, so
--- a slice that arrives after the panel moved on is discarded.
-function load_commits(state, opts)
+-- `reset` is set. Guarded by a per-branch generation counter, so a slice that
+-- arrives after that branch moved on is discarded.
+--
+-- Every branch keeps its own list. Nothing is read for a branch until its
+-- section is opened: a repository with a dozen branches would otherwise run a
+-- dozen logs to draw a panel showing one of them.
+function commit_list(state, ref, create)
+  local list = state.commit_lists[ref]
+  if not list and create then
+    list = { commits = nil, offset = 0, exhausted = false, loading = false, generation = 0 }
+    state.commit_lists[ref] = list
+  end
+  return list
+end
+
+function load_commits(state, ref, opts)
   opts = opts or {}
-  if not valid(state) or state.commit_loading then
+  if not valid(state) or not ref then
     return
   end
-  if not opts.reset and state.commits_exhausted then
+  local list = commit_list(state, ref, true)
+  if list.loading then
     return
   end
-  local skip = opts.reset and 0 or state.commit_offset
+  if not opts.reset and list.exhausted then
+    return
+  end
+  local skip = opts.reset and 0 or list.offset
   local count = opts.count or COMMIT_BATCH
   -- Ask for one commit beyond what is wanted. A full request is otherwise
   -- ambiguous -- it can mean "there is more" or "that was the whole history"
   -- -- and guessing either way is wrong: guessing "more" leaves a Load More
   -- entry that does nothing, guessing "done" hides commits that arrive later.
   local probe = count + 1
-  state.commit_loading = true
-  state.commit_generation = state.commit_generation + 1
-  local commit_generation = state.commit_generation
+  list.loading = true
+  list.generation = list.generation + 1
+  local generation = list.generation
   run_git(state.root, {
     "log",
     "--pretty=format:%H%x09%h%x09%s",
     ("--skip=%d"):format(skip),
     ("-n%d"):format(probe),
+    ref,
+    "--",
   }, function(output)
-    if not valid(state) or state.commit_generation ~= commit_generation then
-      state.commit_loading = false
+    if not valid(state) or state.commit_lists[ref] ~= list or list.generation ~= generation then
+      list.loading = false
       return
     end
     local batch = {}
@@ -603,6 +673,7 @@ function load_commits(state, opts)
       if full_hash and hash and subject then
         batch[#batch + 1] = {
           kind = "commit",
+          ref = ref,
           full_hash = full_hash,
           hash = hash,
           subject = subject,
@@ -613,19 +684,110 @@ function load_commits(state, opts)
     local exhausted = #batch <= count
     batch[count + 1] = nil
     if opts.reset then
-      state.commits = {}
+      list.commits = {}
     end
-    state.commits = state.commits or {}
+    list.commits = list.commits or {}
     for _, commit in ipairs(batch) do
-      state.commits[#state.commits + 1] = commit
+      list.commits[#list.commits + 1] = commit
     end
-    state.commit_offset = #state.commits
-    state.commits_exhausted = exhausted
-    commit_depths[state.root] = {
-      offset = state.commit_offset,
-      exhausted = state.commits_exhausted,
-    }
-    state.commit_loading = false
+    list.offset = #list.commits
+    list.exhausted = exhausted
+    remember_depth(state.root, ref, { offset = list.offset, exhausted = list.exhausted })
+    list.loading = false
+    render(state)
+  end)
+end
+
+-- `%(upstream:track)` says `[ahead 2, behind 1]`; the panel has forty columns
+-- and says the same thing in five.
+local function branch_track(text)
+  if text == "" or text == nil then
+    return ""
+  end
+  if text:find("gone", 1, true) then
+    return "⚑"
+  end
+  local parts = {}
+  local ahead = text:match("ahead (%d+)")
+  local behind = text:match("behind (%d+)")
+  if ahead then
+    parts[#parts + 1] = "↑" .. ahead
+  end
+  if behind then
+    parts[#parts + 1] = "↓" .. behind
+  end
+  return table.concat(parts, " ")
+end
+
+-- The branches themselves, most recently committed to first. A branch nobody
+-- has seen before starts collapsed unless it is the one checked out: the point
+-- of listing them all is to reach for one, not to read them all at once.
+local function load_branches(state)
+  if not valid(state) then
+    return
+  end
+  state.branch_generation = (state.branch_generation or 0) + 1
+  local generation = state.branch_generation
+  run_git(state.root, {
+    "for-each-ref",
+    "--sort=-committerdate",
+    "--format=%(refname:short)%09%(HEAD)%09%(upstream:track)",
+    "refs/heads",
+  }, function(output)
+    if not valid(state) or state.branch_generation ~= generation then
+      return
+    end
+    local branches, live = {}, {}
+    for line in output:gmatch("[^\r\n]+") do
+      local ref, head, track = line:match("^([^\t]*)\t([^\t]*)\t(.*)$")
+      if ref and ref ~= "" then
+        local current = head == "*"
+        branches[#branches + 1] = {
+          ref = ref,
+          current = current,
+          track = branch_track(track),
+          order = #branches,
+        }
+        live[ref] = true
+        local key = branch_key(ref)
+        if state.collapsed[key] == nil then
+          state.collapsed[key] = not current
+        end
+      end
+    end
+    -- A branch that has been deleted takes its section, its list and its
+    -- remembered fold with it.
+    for ref in pairs(state.commit_lists) do
+      if not live[ref] then
+        state.commit_lists[ref] = nil
+      end
+    end
+    for key in pairs(state.collapsed) do
+      local ref = key:match("^branch:(.*)$")
+      if ref and not live[ref] then
+        state.collapsed[key] = nil
+      end
+    end
+    -- git orders by commit date and falls back to the name when two branches
+    -- were committed to in the same second, which is often enough in practice
+    -- to push the checked-out branch out of first place. That position is the
+    -- panel's promise, not git's.
+    table.sort(branches, function(left, right)
+      if left.current ~= right.current then
+        return left.current
+      end
+      return left.order < right.order
+    end)
+    state.branches = branches
+    for _, branch in ipairs(branches) do
+      if not state.collapsed[branch_key(branch.ref)] then
+        local remembered = remembered_depth(state.root, branch.ref)
+        load_commits(state, branch.ref, {
+          reset = true,
+          count = math.max(COMMIT_BATCH, remembered and remembered.offset or 0),
+        })
+      end
+    end
     render(state)
   end)
 end
@@ -805,8 +967,6 @@ function M.refresh(buf, opts)
   local status_generation = state.status_generation
   if not opts.status_only then
     state.changes = nil
-    state.commits = nil
-    state.commits_exhausted = false
     render(state)
   end
 
@@ -831,12 +991,11 @@ function M.refresh(buf, opts)
     return
   end
 
-  -- Reload as many commits as were already on screen, so a refresh triggered
-  -- by a commit or a checkout does not yank the list back to the first batch
-  -- while it is being scrolled.
-  local remembered = commit_depths[state.root]
-  local depth = math.max(COMMIT_BATCH, state.commit_offset, remembered and remembered.offset or 0)
-  load_commits(state, { count = depth, reset = true })
+  -- Reloading the branches reloads the history of every branch that is open,
+  -- as much of it as was already on screen: a refresh triggered by a commit or
+  -- a checkout must not yank a list back to its first batch while it is being
+  -- scrolled, and must not read a word of a branch nobody has opened.
+  load_branches(state)
   sync_timeline(state, { reload = true })
 end
 
@@ -2026,9 +2185,16 @@ local function action(state, focus_preview)
   if entry.kind == "section" then
     state.collapsed[entry.section] = not state.collapsed[entry.section]
     render(state)
+  elseif entry.kind == "branch" then
+    local key = branch_key(entry.ref)
+    state.collapsed[key] = not state.collapsed[key]
+    if not state.collapsed[key] and not commit_list(state, entry.ref, false) then
+      load_commits(state, entry.ref, { reset = true })
+    end
+    render(state)
   elseif entry.kind == "commit_load_more" then
     if not entry.loading then
-      load_commits(state)
+      load_commits(state, entry.ref)
     end
   elseif entry.kind == "timeline_load_more" then
     if not entry.loading then
@@ -2593,7 +2759,7 @@ local function workspace_context_entries(state, entry, mouse)
 end
 
 local function set_all_collapsed(state, collapsed)
-  for _, section in ipairs({ "changes", "commits", "timeline" }) do
+  for _, section in ipairs({ "changes", "branches", "timeline" }) do
     state.collapsed[section] = collapsed
   end
   render(state)
@@ -3419,10 +3585,10 @@ function M.open(explorer, root, attempt, open_opts)
     branch = "Git",
     entries = {},
     collapsed = {
+      branches = false,
       merge = false,
       staged = false,
       changes = false,
-      commits = false,
       timeline = false,
     },
     timeline = { generation = 0, offset = 0 },
@@ -3431,10 +3597,8 @@ function M.open(explorer, root, attempt, open_opts)
     previews = {},
     preview_serial = 0,
     status_generation = 0,
-    commit_generation = 0,
-    commit_offset = 0,
-    commits_exhausted = false,
-    commit_loading = false,
+    commit_lists = {},
+    branch_generation = 0,
     preview_generation = 0,
   }
   states[buf] = state
