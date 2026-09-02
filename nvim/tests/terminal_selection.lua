@@ -116,6 +116,29 @@ local ok, test_error = pcall(function()
 
   -- With no selection standing, the release is what hands typing back.
   assert(TerminalTabs.resume_typing(win), "the release did not hand the terminal back to typing")
+
+  -- ── a right click in the terminal is swallowed at both ends ───────────
+  -- Left to Neovim, the release drops the terminal out of Terminal-Insert:
+  -- a right click that opens no menu would still change the mode.
+  local real_getmousepos = vim.fn.getmousepos
+  local function delivered(key, over)
+    local mapping = vim.fn.maparg(key, "n", false, true)
+    assert(type(mapping.callback) == "function", key .. " has no handler")
+    vim.fn.getmousepos = function()
+      return { winid = over, line = 1, column = 1, screenrow = 1, screencol = 1, winrow = 1, wincol = 1 }
+    end
+    local ok, produced = pcall(mapping.callback)
+    vim.fn.getmousepos = real_getmousepos
+    assert(ok, key .. " errored: " .. tostring(produced))
+    return produced
+  end
+
+  assert(delivered("<RightMouse>", win) == "", "a right click in the terminal was passed to Neovim")
+  assert(delivered("<RightRelease>", win) == "", "the release of a right click in the terminal was passed on")
+  local editor_win = ActivityBar.editor_window()
+  if editor_win then
+    assert(delivered("<RightRelease>", editor_win) ~= "", "an ordinary window lost its own right click")
+  end
 end)
 
 pcall(vim.cmd.stopinsert)

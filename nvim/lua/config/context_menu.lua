@@ -210,6 +210,20 @@ function M.register(name, handler)
   handlers[name] = handler
 end
 
+-- Where a right click belongs to this configuration rather than to Neovim: a
+-- panel, the project terminal, or the menu itself.
+local function ours(mouse)
+  if active_menu and mouse and active_menu.win == mouse.winid then
+    return true
+  end
+  local activity = package.loaded["config.activity_bar"]
+  if activity and activity._over_panel and activity._over_panel(mouse) then
+    return true
+  end
+  local terminal = package.loaded["config.terminal_tabs"]
+  return terminal ~= nil and terminal.owns_window ~= nil and terminal.owns_window(mouse and mouse.winid) == true
+end
+
 function M.setup()
   if setup_done then
     return
@@ -243,12 +257,7 @@ function M.setup()
       -- popup_setpos by default -- which offers Inspect, Paste and Select All
       -- for a panel that cannot be edited, and only closes on a selection or
       -- <Esc>. A panel row without a menu of its own has no menu at all.
-      local activity = package.loaded["config.activity_bar"]
-      if activity and activity._over_panel and activity._over_panel(mouse) then
-        return ""
-      end
-      local terminal = package.loaded["config.terminal_tabs"]
-      if terminal and terminal.owns_window and terminal.owns_window(mouse.winid) then
+      if ours(mouse) then
         return ""
       end
       return key
@@ -257,6 +266,26 @@ function M.setup()
       replace_keycodes = true,
       silent = true,
       desc = "Open project context menu",
+    })
+  end
+
+  -- The press above is swallowed, and the release has to be too. Left to
+  -- Neovim it drops a terminal out of Terminal-Insert: a right click that
+  -- opened no menu would still put the terminal in Normal mode, as a side
+  -- effect of nothing at all.
+  for _, lhs in ipairs({ "<RightRelease>", "<2-RightRelease>", "<3-RightRelease>", "<4-RightRelease>" }) do
+    local key = lhs
+    vim.keymap.set({ "n", "x", "i", "t" }, key, function()
+      local mouse = vim.fn.getmousepos()
+      if ours(mouse) then
+        return ""
+      end
+      return key
+    end, {
+      expr = true,
+      replace_keycodes = true,
+      silent = true,
+      desc = "Finish a project right click",
     })
   end
 end
