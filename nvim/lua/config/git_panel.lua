@@ -1162,11 +1162,31 @@ local function save_preview_views(state)
   end
 end
 
-local function restore_window_options(win, options)
+-- Put the window back the way the diff found it.
+--
+-- Only for the buffer the snapshot was taken with: these are window options,
+-- but they were read off a particular buffer's window and mean nothing to a
+-- different one. A reader who opens a file from the explorer while a diff is
+-- up lands in this window, and handing them the settings of whatever was here
+-- before -- a dashboard, with no line numbers -- takes their line numbers away
+-- for reasons that belong to a buffer they never asked for.
+--
+-- A window being handed to another buffer is given the defaults instead: the
+-- same values it would have if it had just been created, which undoes what the
+-- diff imposed without imposing anything of its own.
+local function restore_window_options(win, options, keeping_buffer)
   if not options or not win or not vim.api.nvim_win_is_valid(win) then
     return
   end
-  pcall(WinOptions.set, win, options)
+  local restored = {}
+  for option, value in pairs(options) do
+    if keeping_buffer then
+      restored[option] = value
+    else
+      restored[option] = vim.api.nvim_get_option_value(option, { scope = "global" })
+    end
+  end
+  pcall(WinOptions.set, win, restored)
 end
 
 -- Remove the two-window diff layout but keep all Git diff buffers listed in
@@ -1223,7 +1243,7 @@ local function hide_preview(state, target_buf, restore_original)
   end
 
   if main_win and vim.api.nvim_win_is_valid(main_win) then
-    restore_window_options(main_win, context and context.options)
+    restore_window_options(main_win, context and context.options, target_buf == (context and context.buf))
     if restore_original and context and target_buf == context.buf and context.view then
       pcall(vim.api.nvim_win_call, main_win, function()
         vim.fn.winrestview(context.view)
@@ -1729,7 +1749,7 @@ activate_preview = function(state, preview, focus_preview)
     })
     if not ok then
       vim.api.nvim_win_set_buf(main_win, editor_context.buf)
-      restore_window_options(main_win, editor_context.options)
+      restore_window_options(main_win, editor_context.options, true)
       pcall(vim.api.nvim_win_call, main_win, function()
         vim.fn.winrestview(editor_context.view)
       end)
