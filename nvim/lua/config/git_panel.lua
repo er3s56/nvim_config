@@ -1310,7 +1310,13 @@ local function set_preview_content(buf, path, content, skipped)
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, content_lines(content, skipped))
   vim.bo[buf].modifiable = false
-  vim.bo[buf].filetype = vim.filetype.match({ filename = path }) or ""
+  -- Only when it actually changes: assigning 'filetype' fires FileType even
+  -- for the value it already had, which detaches the highlighter and attaches
+  -- a fresh one with nothing parsed yet.
+  local filetype = vim.filetype.match({ filename = path }) or ""
+  if vim.bo[buf].filetype ~= filetype then
+    vim.bo[buf].filetype = filetype
+  end
 end
 
 local function update_preview_buffer(buf, name, path, content, skipped)
