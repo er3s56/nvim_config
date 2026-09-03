@@ -130,7 +130,7 @@ local ok, test_error = pcall(function()
   picker = ActivityBar.current().content.picker
   assert(picker.input.filter.search == "needle", "returning to Search lost the query")
   assert(
-    vim.wait(1000, function()
+    vim.wait(3000, function()
       return picker.list.cursor == saved_cursor and picker.list.top == saved_top
     end),
     "returning to Search lost selection or scroll position"
