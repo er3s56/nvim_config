@@ -1323,6 +1323,76 @@ local function close_preview(state)
   end
 end
 
+-- The diff is in the editor area, and the editor area is not the sidebar's.
+--
+-- Switching from Git to the explorer destroys the panel, and the panel used to
+-- take its diffs down with it: the reader clicked a file in CHANGES, read it,
+-- clicked another icon, and what they were reading was gone. Which panel is
+-- showing on the left is not a statement about what belongs on the right.
+--
+-- So a panel being put away leaves its previews here, and the next panel on
+-- the same repository and tab takes them back. What is left holds the fields the
+-- preview machinery reads, so it can be hidden, closed and deleted by exactly
+-- the functions a live panel uses -- no second implementation of any of it.
+local retained = {}
+
+local function retain_previews(state)
+  local layout = state.preview_layout
+  if not layout or not vim.api.nvim_win_is_valid(layout.main_win) then
+    close_preview(state)
+    return
+  end
+  -- Keyed by tab as well as repository: the same repository open in two tabs
+  -- is two diffs, in two editor areas, and neither is the other's to close.
+  retained[placement_key(state.root, vim.api.nvim_win_get_tabpage(layout.main_win))] = {
+    previews = state.previews,
+    preview = state.preview,
+    preview_layout = layout,
+    preview_generation = state.preview_generation,
+  }
+  -- Moved, not shared: whatever the panel does on its way out -- and its
+  -- buffer being wiped runs the teardown a second time -- must find nothing
+  -- left to close.
+  state.previews = {}
+  state.preview = nil
+  state.preview_layout = nil
+end
+
+local function adopt_previews(state)
+  local key = placement_key(state.root, vim.api.nvim_win_get_tabpage(state.win))
+  local kept = retained[key]
+  if not kept then
+    return
+  end
+  retained[key] = nil
+  local layout = kept.preview_layout
+  if
+    not layout
+    or not vim.api.nvim_win_is_valid(layout.main_win)
+    or not vim.api.nvim_win_is_valid(layout.after_win)
+  then
+    -- The reader closed the diff while no panel was watching. Let the usual
+    -- teardown decide which of its buffers were the panel's to close.
+    close_preview(kept)
+    return
+  end
+  state.previews = kept.previews or {}
+  state.preview = kept.preview
+  state.preview_layout = layout
+  state.editor_win = layout.main_win
+end
+
+-- A diff with no panel behind it still has to get out of the way when the
+-- reader opens something else in its window, which is what the panel would
+-- have done for it.
+local function put_retained_away(key, shadow, target_buf)
+  retained[key] = nil
+  hide_preview(shadow, target_buf, false)
+  for _, preview in pairs(shadow.previews or {}) do
+    delete_preview(shadow, preview)
+  end
+end
+
 local function content_lines(content, skipped)
   if skipped then
     return { skipped }
@@ -3220,7 +3290,7 @@ function M.detach(state)
   if not valid(state) then
     return
   end
-  close_preview(state)
+  retain_previews(state)
   local win, buf = state.win, state.buf
   states[buf] = nil
   sync_hover_events()
@@ -3784,6 +3854,9 @@ function M.open(explorer, root, attempt, open_opts)
     preview_generation = 0,
   }
   states[buf] = state
+  -- Whatever the last panel on this repository left in the editor area is
+  -- this panel's again: the reader never asked for it to change.
+  adopt_previews(state)
   start_git_watcher(state)
   setup_context_menu()
   setup_global_mouse_mappings()
@@ -4123,10 +4196,26 @@ vim.api.nvim_create_autocmd("BufEnter", {
         end
       end
     end
+    for key, shadow in pairs(retained) do
+      local layout = shadow.preview_layout
+      if
+        layout
+        and not preview_showing_buffer(shadow, event.buf)
+        and (source_win == layout.main_win or source_win == layout.after_win)
+      then
+        local target_buf = event.buf
+        vim.schedule(function()
+          if shadow.preview_layout == layout and vim.api.nvim_buf_is_valid(target_buf) then
+            put_retained_away(key, shadow, target_buf)
+          end
+        end)
+      end
+    end
   end,
 })
 
 M._states = states
+M._retained = retained
 M._commit_depths = commit_depths
 M._display_path = display_path
 M._render = render

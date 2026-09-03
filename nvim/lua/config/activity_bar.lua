@@ -1374,7 +1374,23 @@ local function arrange_terminal(state)
   local before = vim.api.nvim_win_get_height(terminal)
   local terminal_pos = vim.api.nvim_win_get_position(terminal)
   local editor_pos = vim.api.nvim_win_get_position(editor)
-  if terminal_pos[2] ~= editor_pos[2] or vim.api.nvim_win_get_width(terminal) ~= vim.api.nvim_win_get_width(editor) then
+  -- The terminal spans the editor area, which is not always one window: a Git
+  -- diff makes it two, side by side, and the editor candidate is then only its
+  -- left half. Measuring against that half would call a correctly placed
+  -- terminal misplaced and move it under one side, which pushes the other side
+  -- out of the editor area altogether. Everything from the editor's left edge
+  -- rightwards is the area -- the Activity Bar and the sidebar are left of it.
+  local area_left = editor_pos[2]
+  local area_right = area_left + vim.api.nvim_win_get_width(editor)
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(state.tab)) do
+    if win ~= terminal and vim.api.nvim_win_get_config(win).relative == "" then
+      local pos = vim.api.nvim_win_get_position(win)
+      if pos[2] >= area_left then
+        area_right = math.max(area_right, pos[2] + vim.api.nvim_win_get_width(win))
+      end
+    end
+  end
+  if terminal_pos[2] ~= area_left or vim.api.nvim_win_get_width(terminal) ~= area_right - area_left then
     local fixed = vim.wo[terminal].winfixheight
     WinOptions.set(terminal, { winfixheight = false })
     pcall(vim.fn.win_splitmove, terminal, editor, { vertical = false, rightbelow = true })

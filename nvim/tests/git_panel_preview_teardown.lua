@@ -18,6 +18,12 @@ local function wait_for(condition, message)
   assert(vim.wait(5000, condition, 50), message)
 end
 
+-- Retention is keyed by repository and tab; the count is what this test
+-- cares about, and it does not have to know how the key is spelled.
+local function held()
+  return vim.tbl_count(GitPanel._retained)
+end
+
 local function listed(buf)
   return vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].buflisted
 end
@@ -58,9 +64,14 @@ local ok, test_error = pcall(function()
     vim.api.nvim_set_current_win(panel.win)
     vim.api.nvim_win_set_cursor(panel.win, { row, 0 })
     vim.fn.maparg("<CR>", "n", false, true).callback()
+    -- Not merely that a diff is up: a panel that took back the diff it left
+    -- behind already has one, and waiting for that races the read of this one.
     wait_for(function()
-      return panel.preview ~= nil and panel.preview_layout ~= nil
-    end, "the diff never opened")
+      return panel.preview_layout ~= nil
+        and panel.preview ~= nil
+        and panel.preview.entry
+        and panel.preview.entry.path == path
+    end, "the diff for " .. path .. " never opened")
     return panel.preview
   end
 
@@ -121,6 +132,105 @@ local ok, test_error = pcall(function()
   wait_for(function()
     return not vim.api.nvim_buf_is_valid(diff_buf) or not listed(diff_buf)
   end, "a diff nobody was reading was left behind in the tab bar")
+
+  -- ── a diff outlives the panel that opened it ──────────────────────────
+  -- Which panel is showing on the left says nothing about what belongs on
+  -- the right: switching to the explorer leaves the diff where it is, and the
+  -- next Git panel takes it back rather than opening a second one.
+  ActivityBar.open("git", { focus = false })
+  wait_for(function()
+    local current = ActivityBar.current()
+    return current.content and current.content.kind == "git" and current.content.git_state
+  end, "the Git panel did not come back")
+  panel = ActivityBar.current().content.git_state
+  GitPanel.refresh(panel.buf, { status_only = true })
+  local kept = open_diff("tracked.c")
+  local layout = panel.preview_layout
+  local main_win, after_win = layout.main_win, layout.after_win
+
+  ActivityBar.open("explorer", { focus = false })
+  wait_for(function()
+    local current = ActivityBar.current()
+    return current.content and current.content.kind == "explorer"
+  end, "the Explorer did not replace the Git panel")
+  assert(
+    vim.api.nvim_win_is_valid(main_win) and vim.api.nvim_win_is_valid(after_win),
+    "switching panels closed the diff"
+  )
+  assert(vim.wo[main_win].diff and vim.wo[after_win].diff, "switching panels took the diff out of diff mode")
+  assert(held() == 1, "the diff was not held for the next panel")
+
+  ActivityBar.open("git", { focus = false })
+  wait_for(function()
+    local current = ActivityBar.current()
+    return current.content and current.content.kind == "git" and current.content.git_state
+  end, "the Git panel did not come back a second time")
+  local returned = ActivityBar.current().content.git_state
+  assert(held() == 0, "the returning panel did not take its diff back")
+  assert(returned.preview_layout, "the returning panel came back without the diff it left")
+  assert(
+    returned.preview_layout.main_win == main_win and returned.preview_layout.after_win == after_win,
+    "the returning panel opened a second diff instead of taking back the one it left"
+  )
+  assert(returned.preview == kept, "the returning panel lost track of which diff was showing")
+
+  -- And with no panel watching, opening something else still puts it away.
+  ActivityBar.open("explorer", { focus = false })
+  wait_for(function()
+    return held() == 1
+  end, "the diff was not held the second time")
+  vim.api.nvim_set_current_win(main_win)
+  vim.cmd.edit(vim.fn.fnameescape(root .. "/other.c"))
+  wait_for(function()
+    return not vim.api.nvim_win_is_valid(after_win) and held() == 0
+  end, "a diff with no panel behind it did not get out of the way")
+
+  -- ── one repository, two tabs, two diffs ───────────────────────────────
+  -- Each tab has its own editor area, so each has its own diff, and neither
+  -- is the other's to take back. Held by repository alone they would be one.
+  ActivityBar.open("git", { focus = false })
+  wait_for(function()
+    local current = ActivityBar.current()
+    return current.content and current.content.kind == "git" and current.content.git_state
+  end, "the Git panel did not come back for the first tab")
+  panel = ActivityBar.current().content.git_state
+  GitPanel.refresh(panel.buf, { status_only = true })
+  open_diff("tracked.c")
+  local first_main = panel.preview_layout.main_win
+  ActivityBar.open("explorer", { focus = false })
+  wait_for(function()
+    return held() == 1
+  end, "the first tab's diff was not held")
+
+  vim.cmd("tabnew")
+  ActivityBar.setup()
+  local second = ActivityBar.open("git", { focus = false })
+  wait_for(function()
+    return second.content and second.content.kind == "git" and second.content.git_state
+  end, "the second tab has no Git panel")
+  panel = second.content.git_state
+  GitPanel.refresh(panel.buf, { status_only = true })
+  open_diff("tracked.c")
+  local second_main = panel.preview_layout.main_win
+  assert(second_main ~= first_main, "the second tab opened its diff in the first tab's window")
+  ActivityBar.open("explorer", { focus = false })
+  wait_for(function()
+    return held() == 2
+  end, "the second tab's diff displaced the first tab's")
+
+  vim.cmd("tabfirst")
+  local back = ActivityBar.open("git", { focus = false })
+  wait_for(function()
+    return back.content and back.content.kind == "git" and back.content.git_state
+  end, "the first tab's Git panel did not come back")
+  panel = back.content.git_state
+  wait_for(function()
+    return panel.preview_layout ~= nil
+  end, "the first tab did not take its own diff back")
+  assert(
+    panel.preview_layout.main_win == first_main,
+    "the first tab took back the diff belonging to another tab"
+  )
 end)
 
 pcall(ActivityBar.close)

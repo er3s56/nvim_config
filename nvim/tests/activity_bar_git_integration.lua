@@ -84,6 +84,12 @@ local ok, test_error = pcall(function()
     "Activity Bar Git did not open its Diff layout"
   )
 
+  local diff_main = git_state.preview_layout.main_win
+  local diff_after = git_state.preview_layout.after_win
+  local diff_before = vim.api.nvim_win_get_buf(diff_main)
+  local diff_side = vim.api.nvim_win_get_buf(diff_after)
+  assert(diff_main == editor_win, "the diff did not take the central editor window")
+
   ActivityBar.open("explorer")
   assert(
     vim.wait(3000, function()
@@ -94,7 +100,18 @@ local ok, test_error = pcall(function()
   assert(vim.api.nvim_win_is_valid(editor_win), "switching away from Git Diff deleted the central editor")
   assert(ActivityBar.editor_window() == editor_win, "switching away from Git Diff replaced the central editor")
   assert(vim.api.nvim_buf_is_valid(vim.api.nvim_win_get_buf(editor_win)), "Git Diff left no usable editor buffer")
-  assert(not vim.wo[editor_win].diff, "Git Diff mode leaked into the restored editor")
+  -- Which panel is showing on the left says nothing about what belongs on the
+  -- right. The diff the reader opened is still open, in both of its windows,
+  -- still showing what it showed and still comparing them.
+  assert(
+    vim.api.nvim_win_is_valid(diff_main) and vim.api.nvim_win_is_valid(diff_after),
+    "switching panels closed the diff the reader was reading"
+  )
+  assert(vim.wo[diff_main].diff and vim.wo[diff_after].diff, "switching panels took the diff out of diff mode")
+  assert(
+    vim.api.nvim_win_get_buf(diff_main) == diff_before and vim.api.nvim_win_get_buf(diff_after) == diff_side,
+    "switching panels changed what the diff was showing"
+  )
 
   local sidebar = assert(ActivityBar._content_root(state.content))
   local active_terminal_group = assert(TerminalTabs._groups[TerminalTabs._normalize_root(root)])
@@ -105,7 +122,13 @@ local ok, test_error = pcall(function()
       {
         { "leaf", state.activity.win },
         { "leaf", sidebar },
-        { "col", { { "leaf", editor_win }, { "leaf", terminal_win } } },
+        {
+          "col",
+          {
+            { "row", { { "leaf", diff_main }, { "leaf", diff_after } } },
+            { "leaf", terminal_win },
+          },
+        },
       },
     }),
     "switching away from Git Diff corrupted the Activity Bar layout: " .. vim.inspect(vim.fn.winlayout())
