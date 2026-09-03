@@ -1221,7 +1221,22 @@ local function hide_preview(state, target_buf, restore_original)
 
   local context = layout.editor_context
   if not target_buf and restore_original and context then
-    target_buf = context.buf
+    -- Unless the reader has been given a file here since. The snapshot says
+    -- what this window held when the diff took it over, which was a while and
+    -- one decision ago: opening a file from the explorer while a diff is up
+    -- puts it in this very window, and if it is the file under review it is
+    -- also the diff's own working-tree side, so nothing tore the layout down.
+    -- Putting the snapshot back would take that file off the screen -- and
+    -- then take the file with it, because a buffer nothing is showing looks
+    -- to everything downstream like one the panel opened and nobody wants.
+    local showing = vim.api.nvim_win_is_valid(layout.main_win) and vim.api.nvim_win_get_buf(layout.main_win)
+    local readers_own = showing
+      and showing ~= context.buf
+      and vim.bo[showing].buftype == ""
+      and vim.api.nvim_buf_get_name(showing) ~= ""
+    if not readers_own then
+      target_buf = context.buf
+    end
   end
   if target_buf and not vim.api.nvim_buf_is_valid(target_buf) then
     target_buf = nil
