@@ -1,3 +1,5 @@
+local WinOptions = require("config.win_options")
+
 local M = {}
 
 local active_menu
@@ -97,9 +99,11 @@ function M.open(entries, mouse, opts)
     focusable = true,
     zindex = opts.zindex or 250,
   })
-  vim.wo[win].cursorline = true
-  vim.wo[win].winhighlight = opts.winhighlight or "Normal:NormalFloat,FloatBorder:FloatBorder,CursorLine:PmenuSel"
-  vim.wo[win].wrap = false
+  WinOptions.set(win, {
+    cursorline = true,
+    winhighlight = opts.winhighlight or "Normal:NormalFloat,FloatBorder:FloatBorder,CursorLine:PmenuSel",
+    wrap = false,
+  })
 
   active_menu = { buf = buf, win = win, entries = entries }
   for index, entry in ipairs(entries) do

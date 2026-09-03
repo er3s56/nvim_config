@@ -1,4 +1,5 @@
 local PanelLayout = require("config.panel_layout")
+local WinOptions = require("config.win_options")
 
 local M = {}
 
@@ -284,7 +285,7 @@ local function set_winbar(item)
   terminal.opts.wo = terminal.opts.wo or {}
   terminal.opts.wo.winbar = WINBAR
   if terminal:win_valid() then
-    vim.wo[terminal.win].winbar = WINBAR
+    WinOptions.set(terminal.win, { winbar = WINBAR })
   end
 end
 
@@ -359,7 +360,7 @@ local function mark_bottom_terminal(terminal, win)
     relative = "editor",
     stack = true,
   }
-  vim.wo[win].winfixheight = true
+  WinOptions.set(win, { winfixheight = true })
 end
 
 local function focus_terminal(item)

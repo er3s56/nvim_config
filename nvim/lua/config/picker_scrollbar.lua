@@ -14,6 +14,8 @@
 -- is rejected upstream). A terminal buffer is ordinary, though -- output
 -- lines plus the screen -- so the same float driven by the window's real
 -- topline works, refreshed on scrolling and on output.
+local WinOptions = require("config.win_options")
+
 local M = {}
 
 -- list window id -> { win = bar float, buf = bar buffer }
@@ -81,7 +83,7 @@ local function place_bar(target_win, total, top)
   if not ok or not vim.api.nvim_win_is_valid(win) then
     return
   end
-  vim.wo[win].winhighlight = "Normal:ScrollView,EndOfBuffer:ScrollView"
+  WinOptions.set(win, { winhighlight = "Normal:ScrollView,EndOfBuffer:ScrollView" })
   bars[target_win] = { win = win, buf = buf }
 end
 

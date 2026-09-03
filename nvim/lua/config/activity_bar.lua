@@ -1,6 +1,7 @@
 local ContextMenu = require("config.context_menu")
 local PanelLayout = require("config.panel_layout")
 local TerminalTabs = require("config.terminal_tabs")
+local WinOptions = require("config.win_options")
 
 local M = {}
 
@@ -56,7 +57,7 @@ end
 local function pin_buffer(win)
   if vim.fn.exists("&winfixbuf") == 1 then
     pcall(function()
-      vim.wo[win].winfixbuf = true
+      WinOptions.set(win, { winfixbuf = true })
     end)
   end
 end
@@ -207,7 +208,7 @@ local function hold_slot(state, old_root)
   for _, win in ipairs(vim.api.nvim_tabpage_list_wins(state.tab)) do
     if vim.api.nvim_win_get_config(win).relative == "" and win ~= old_root then
       frozen[win] = vim.wo[win].winfixwidth
-      vim.wo[win].winfixwidth = true
+      WinOptions.set(win, { winfixwidth = true })
     end
   end
   -- 'equalalways' re-balances every window on each split and close, which is
@@ -216,7 +217,7 @@ local function hold_slot(state, old_root)
   vim.o.equalalways = false
   -- The placeholder's columns must come out of the sidebar itself, not the
   -- frozen remainder of the layout.
-  vim.wo[old_root].winfixwidth = false
+  WinOptions.set(old_root, { winfixwidth = false })
   local buf = vim.api.nvim_create_buf(false, true)
   vim.bo[buf].bufhidden = "wipe"
   local ok, placeholder = pcall(vim.api.nvim_open_win, buf, false, {
@@ -229,14 +230,14 @@ local function hold_slot(state, old_root)
     vim.o.equalalways = equalalways
     for win, fixed in pairs(frozen) do
       if valid_win(win) then
-        vim.wo[win].winfixwidth = fixed
+        WinOptions.set(win, { winfixwidth = fixed })
       end
     end
     return
   end
   -- The only window whose width is not fixed: closing the old sidebar hands
   -- its space to the placeholder, and the new sidebar takes it back from it.
-  vim.wo[placeholder].winfixwidth = false
+  WinOptions.set(placeholder, { winfixwidth = false })
   state.slot_hold = { win = placeholder, frozen = frozen, equalalways = equalalways }
 end
 
@@ -256,11 +257,11 @@ local function drop_slot_placeholder(state, absorber)
   local absorber_fixed
   if valid_win(absorber) and absorber ~= hold.win then
     absorber_fixed = vim.wo[absorber].winfixwidth
-    vim.wo[absorber].winfixwidth = false
+    WinOptions.set(absorber, { winfixwidth = false })
   end
   pcall(vim.api.nvim_win_close, hold.win, true)
   if absorber_fixed ~= nil and valid_win(absorber) then
-    vim.wo[absorber].winfixwidth = absorber_fixed
+    WinOptions.set(absorber, { winfixwidth = absorber_fixed })
   end
 end
 
@@ -272,7 +273,7 @@ local function thaw_slot(state)
   state.slot_hold = nil
   for win, fixed in pairs(hold.frozen) do
     if valid_win(win) then
-      vim.wo[win].winfixwidth = fixed
+      WinOptions.set(win, { winfixwidth = fixed })
     end
   end
   if hold.equalalways ~= nil then
@@ -371,18 +372,20 @@ local function configure_activity_buffer(state)
   -- scratch buffer shows up as a buffer tab and is reachable with <S-h>/<S-l>.
   vim.bo[buf].buflisted = false
   vim.bo[buf].filetype = "activity_bar"
-  vim.wo[win].cursorline = true
-  vim.wo[win].number = false
-  vim.wo[win].relativenumber = false
-  vim.wo[win].signcolumn = "no"
-  vim.wo[win].statuscolumn = ""
-  vim.wo[win].foldcolumn = "0"
-  vim.wo[win].wrap = false
-  vim.wo[win].winfixwidth = true
-  vim.wo[win].winbar = ""
+  WinOptions.set(win, {
+    cursorline = true,
+    number = false,
+    relativenumber = false,
+    signcolumn = "no",
+    statuscolumn = "",
+    foldcolumn = "0",
+    wrap = false,
+    winfixwidth = true,
+    winbar = "",
+  })
   -- LazyVim enables 'list' globally, which would draw the `listchars` space
   -- dot in front of every icon. Panels are chrome, not file content.
-  vim.wo[win].list = false
+  WinOptions.set(win, { list = false })
   pin_buffer(win)
 
   local function activate()
@@ -766,7 +769,7 @@ local function set_search_winbar(state, picker, attempt)
   picker.opts.win.input.wo.winbar = winbar
   picker.input.win.opts.wo = picker.input.win.opts.wo or {}
   picker.input.win.opts.wo.winbar = winbar
-  vim.wo[picker.input.win.win].winbar = winbar
+  WinOptions.set(picker.input.win.win, { winbar = winbar })
 end
 
 local function create_plain_sidebar(state, width, filetype, lines)
@@ -785,13 +788,15 @@ local function create_plain_sidebar(state, width, filetype, lines)
   vim.bo[buf].filetype = filetype
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
-  vim.wo[win].number = false
-  vim.wo[win].relativenumber = false
-  vim.wo[win].signcolumn = "no"
-  vim.wo[win].statuscolumn = ""
-  vim.wo[win].wrap = true
-  vim.wo[win].winfixwidth = true
-  vim.wo[win].list = false
+  WinOptions.set(win, {
+    number = false,
+    relativenumber = false,
+    signcolumn = "no",
+    statuscolumn = "",
+    wrap = true,
+    winfixwidth = true,
+    list = false,
+  })
   disable_selection_gestures(buf)
   return { win = win, buf = buf }
 end
@@ -904,8 +909,8 @@ local function arrange_activity(state, root)
   end
   local root_fixed = vim.wo[root].winfixwidth
   local activity_fixed = vim.wo[state.activity.win].winfixwidth
-  vim.wo[root].winfixwidth = false
-  vim.wo[state.activity.win].winfixwidth = false
+  WinOptions.set(root, { winfixwidth = false })
+  WinOptions.set(state.activity.win, { winfixwidth = false })
   -- Snacks layouts with position="left" may move their root back to the
   -- outermost split during layout:update(), especially after a responsive
   -- hide/restore. Move it behind Activity Bar after every such update.
@@ -923,13 +928,13 @@ local function arrange_activity(state, root)
     })
   end
   if valid_win(root) then
-    vim.wo[root].winfixwidth = root_fixed
+    WinOptions.set(root, { winfixwidth = root_fixed })
   end
   if ok and result == 0 and valid_win(state.activity.win) then
     pcall(vim.api.nvim_win_set_width, state.activity.win, ACTIVITY_WIDTH)
   end
   if valid_win(state.activity.win) then
-    vim.wo[state.activity.win].winfixwidth = activity_fixed or true
+    WinOptions.set(state.activity.win, { winfixwidth = activity_fixed or true })
   end
 end
 
@@ -958,14 +963,14 @@ local function restore_placement(state, root, width)
   -- removed sidebar's width to Activity Bar while the Picker closes.
   arrange_activity(state, root)
   local fixed = vim.wo[root].winfixwidth
-  vim.wo[root].winfixwidth = false
+  WinOptions.set(root, { winfixwidth = false })
   pcall(vim.api.nvim_win_set_width, root, width)
-  vim.wo[root].winfixwidth = fixed or true
+  WinOptions.set(root, { winfixwidth = fixed or true })
   state.sidebar_applied = width
   if valid_win(state.activity.win) then
-    vim.wo[state.activity.win].winfixwidth = false
+    WinOptions.set(state.activity.win, { winfixwidth = false })
     pcall(vim.api.nvim_win_set_width, state.activity.win, ACTIVITY_WIDTH)
-    vim.wo[state.activity.win].winfixwidth = true
+    WinOptions.set(state.activity.win, { winfixwidth = true })
   end
   return restored
 end
@@ -1371,10 +1376,10 @@ local function arrange_terminal(state)
   local editor_pos = vim.api.nvim_win_get_position(editor)
   if terminal_pos[2] ~= editor_pos[2] or vim.api.nvim_win_get_width(terminal) ~= vim.api.nvim_win_get_width(editor) then
     local fixed = vim.wo[terminal].winfixheight
-    vim.wo[terminal].winfixheight = false
+    WinOptions.set(terminal, { winfixheight = false })
     pcall(vim.fn.win_splitmove, terminal, editor, { vertical = false, rightbelow = true })
     if valid_win(terminal) then
-      vim.wo[terminal].winfixheight = fixed or true
+      WinOptions.set(terminal, { winfixheight = fixed or true })
     end
   end
   if valid_win(terminal) and valid_win(editor) then
@@ -1396,10 +1401,10 @@ local function arrange_terminal(state)
     end
     local target = math.max(minimum, math.min(desired, math.max(1, total - editor_minimum)))
     if target ~= current then
-      vim.wo[terminal].winfixheight = false
+      WinOptions.set(terminal, { winfixheight = false })
       pcall(vim.api.nvim_win_set_height, terminal, target)
       if valid_win(terminal) then
-        vim.wo[terminal].winfixheight = true
+        WinOptions.set(terminal, { winfixheight = true })
       end
     end
     state.terminal_height = target
@@ -1453,9 +1458,9 @@ function M.reflow(tab)
   reflowing = true
   local ok, err = pcall(call_in_tab, state.tab, function()
     if valid_win(state.activity.win) then
-      vim.wo[state.activity.win].winfixwidth = false
+      WinOptions.set(state.activity.win, { winfixwidth = false })
       pcall(vim.api.nvim_win_set_width, state.activity.win, ACTIVITY_WIDTH)
-      vim.wo[state.activity.win].winfixwidth = true
+      WinOptions.set(state.activity.win, { winfixwidth = true })
     end
     local root = content_root(state.content)
     -- A width that no longer matches what Activity Bar last applied came from
@@ -1482,17 +1487,17 @@ function M.reflow(tab)
       begin_open(state, false)
     elseif width and root then
       local fixed = vim.wo[root].winfixwidth
-      vim.wo[root].winfixwidth = false
+      WinOptions.set(root, { winfixwidth = false })
       pcall(vim.api.nvim_win_set_width, root, width)
-      vim.wo[root].winfixwidth = fixed or true
+      WinOptions.set(root, { winfixwidth = fixed or true })
       if state.content and state.content.picker and state.content.picker.layout then
         state.content.picker.layout:update()
       end
       arrange_activity(state, root)
       if valid_win(root) then
-        vim.wo[root].winfixwidth = false
+        WinOptions.set(root, { winfixwidth = false })
         pcall(vim.api.nvim_win_set_width, root, width)
-        vim.wo[root].winfixwidth = true
+        WinOptions.set(root, { winfixwidth = true })
       end
       state.sidebar_applied = width
       if state.content and state.content.kind == "search" and state.content.picker then

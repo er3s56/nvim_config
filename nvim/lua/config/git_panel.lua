@@ -2,6 +2,7 @@ local BinaryFiles = require("config.binary_files")
 local ContextMenu = require("config.context_menu")
 local GitOps = require("config.git_ops")
 local PanelLayout = require("config.panel_layout")
+local WinOptions = require("config.win_options")
 local TerminalTabs = require("config.terminal_tabs")
 
 local M = {}
@@ -1165,11 +1166,7 @@ local function restore_window_options(win, options)
   if not options or not win or not vim.api.nvim_win_is_valid(win) then
     return
   end
-  for option, value in pairs(options) do
-    pcall(function()
-      vim.wo[win][option] = value
-    end)
-  end
+  pcall(WinOptions.set, win, options)
 end
 
 -- Remove the two-window diff layout but keep all Git diff buffers listed in
@@ -1546,10 +1543,10 @@ function M.reflow_layout()
         local current = vim.api.nvim_win_get_height(terminal.win)
         local terminal_height = math.max(min_terminal, math.min(current, math.max(1, usable_rows - min_upper)))
         if terminal_height ~= current then
-          vim.wo[terminal.win].winfixheight = false
+          WinOptions.set(terminal.win, { winfixheight = false })
           pcall(vim.api.nvim_win_set_height, terminal.win, terminal_height)
           if vim.api.nvim_win_is_valid(terminal.win) then
-            vim.wo[terminal.win].winfixheight = true
+            WinOptions.set(terminal.win, { winfixheight = true })
           end
         end
       end
@@ -1571,10 +1568,10 @@ function M.reflow_layout()
           local min_explorer = left_content_height >= 18 and 8 or left_content_height >= 10 and 5 or 2
           local max_git = math.max(1, left_content_height - min_explorer)
           local target = math.max(1, math.min(default_git_height(left_content_height), max_git))
-          vim.wo[state.win].winfixheight = false
+          WinOptions.set(state.win, { winfixheight = false })
           pcall(vim.api.nvim_win_set_height, state.win, target)
           if vim.api.nvim_win_is_valid(state.win) then
-            vim.wo[state.win].winfixheight = true
+            WinOptions.set(state.win, { winfixheight = true })
           end
           if state.explorer and state.explorer.layout and state.explorer.layout:valid() then
             state.explorer.layout:update()
@@ -1593,10 +1590,10 @@ function M.reflow_layout()
           local max_explorer_width = math.max(1, vim.o.columns - min_editor_width - 1)
           local target = math.max(1, math.min(math.max(preferred, min_explorer_width), max_explorer_width))
           local fixed = vim.wo[root.win].winfixwidth
-          vim.wo[root.win].winfixwidth = false
+          WinOptions.set(root.win, { winfixwidth = false })
           pcall(vim.api.nvim_win_set_width, root.win, target)
           if root:valid() then
-            vim.wo[root.win].winfixwidth = fixed
+            WinOptions.set(root.win, { winfixwidth = fixed })
             explorer.layout:update()
           end
         end
@@ -1764,14 +1761,16 @@ activate_preview = function(state, preview, focus_preview)
     vim.api.nvim_win_call(item.win, function()
       vim.cmd("diffthis")
     end)
-    vim.wo[item.win].foldenable = false
-    vim.wo[item.win].wrap = false
-    vim.wo[item.win].cursorline = true
-    vim.wo[item.win].number = true
-    vim.wo[item.win].relativenumber = false
-    vim.wo[item.win].scrollbind = true
-    vim.wo[item.win].cursorbind = false
-    vim.wo[item.win].winbar = "  " .. item.label
+    WinOptions.set(item.win, {
+      foldenable = false,
+      wrap = false,
+      cursorline = true,
+      number = true,
+      relativenumber = false,
+      scrollbind = true,
+      cursorbind = false,
+      winbar = "  " .. item.label,
+    })
   end
 
   local placement = preview.layout_placement
@@ -1790,8 +1789,8 @@ activate_preview = function(state, preview, focus_preview)
   -- winrestview() on one scroll-bound window also moves its partner. Restore
   -- both snapshots independently, then re-enable binding; otherwise the
   -- second restore overwrites the first and a tab round-trip changes position.
-  vim.wo[layout.main_win].scrollbind = false
-  vim.wo[layout.after_win].scrollbind = false
+  WinOptions.set(layout.main_win, { scrollbind = false })
+  WinOptions.set(layout.after_win, { scrollbind = false })
   for index, win in ipairs({ layout.main_win, layout.after_win }) do
     pcall(vim.api.nvim_win_call, win, function()
       vim.fn.winrestview(preview.views[index] or {
@@ -1803,8 +1802,8 @@ activate_preview = function(state, preview, focus_preview)
       })
     end)
   end
-  vim.wo[layout.main_win].scrollbind = true
-  vim.wo[layout.after_win].scrollbind = true
+  WinOptions.set(layout.main_win, { scrollbind = true })
+  WinOptions.set(layout.after_win, { scrollbind = true })
   if focus_preview then
     vim.api.nvim_set_current_win(layout.after_win)
   end
@@ -2271,7 +2270,7 @@ function reload_preview(state, preview, entry)
       { win = layout.after_win, label = preview.after_label },
     }) do
       if vim.api.nvim_win_is_valid(item.win) then
-        vim.wo[item.win].winbar = "  " .. item.label
+        WinOptions.set(item.win, { winbar = "  " .. item.label })
         pcall(vim.api.nvim_win_call, item.win, function()
           vim.cmd("diffupdate")
         end)
@@ -3693,15 +3692,17 @@ function M.open(explorer, root, attempt, open_opts)
   vim.bo[buf].swapfile = false
   vim.bo[buf].filetype = "project_git_panel"
   vim.bo[buf].modifiable = false
-  vim.wo[win].cursorline = true
-  vim.wo[win].number = false
-  vim.wo[win].relativenumber = false
-  vim.wo[win].signcolumn = "no"
-  vim.wo[win].statuscolumn = ""
-  vim.wo[win].wrap = false
-  vim.wo[win].list = false
-  vim.wo[win].winfixheight = not target_win
-  vim.wo[win].winfixwidth = target_win ~= nil
+  WinOptions.set(win, {
+    cursorline = true,
+    number = false,
+    relativenumber = false,
+    signcolumn = "no",
+    statuscolumn = "",
+    wrap = false,
+    list = false,
+    winfixheight = not target_win,
+    winfixwidth = target_win ~= nil,
+  })
   -- Text-selection gestures do not belong in the panel: they select words and
   -- lines of the rendered tree and strand it in Visual mode. The panel's own
   -- multi-click mappings below replace the ones that carry an action.
