@@ -3,6 +3,7 @@ local uv = vim.uv or vim.loop
 local FileOps = require("config.explorer_file_ops")
 local Platform = require("config.explorer_platform")
 local ContextMenu = require("config.context_menu")
+local Pinned = require("config.pinned")
 
 local M = {}
 
@@ -392,6 +393,36 @@ local function delete_items(ctx)
   end)
 end
 
+local function all_pinned(ctx)
+  local root = project_root(ctx.picker)
+  for _, path in ipairs(ctx.paths) do
+    if not Pinned.is_pinned(root, path) then
+      return false
+    end
+  end
+  return #ctx.paths > 0
+end
+
+local function pinned_label(ctx)
+  if all_pinned(ctx) then
+    return #ctx.paths > 1 and "Unpin These" or "Unpin"
+  end
+  return #ctx.paths > 1 and "Pin These" or "Pin"
+end
+
+local function toggle_pins(ctx)
+  local root = project_root(ctx.picker)
+  local unpinning = all_pinned(ctx)
+  for _, path in ipairs(ctx.paths) do
+    if unpinning then
+      Pinned.remove(root, path)
+    else
+      Pinned.add(root, path)
+    end
+  end
+  info((unpinning and "Unpinned " or "Pinned ") .. #ctx.paths .. " path(s)")
+end
+
 local function entries_for(ctx)
   local has_item = ctx.item ~= nil
   local has_paths = #ctx.paths > 0
@@ -407,6 +438,15 @@ local function entries_for(ctx)
       label = "Reveal in File Manager",
       action = function()
         reveal_item(ctx)
+      end,
+    },
+    {
+      -- Whole selections at once: pinning six driver directories one right
+      -- click at a time is the tedium this is meant to remove.
+      label = pinned_label(ctx),
+      enabled = has_paths,
+      action = function()
+        toggle_pins(ctx)
       end,
     },
     { separator = true },

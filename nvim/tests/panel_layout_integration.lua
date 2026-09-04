@@ -50,13 +50,15 @@ local ok, test_error = pcall(function()
   vim.api.nvim_win_set_buf(editor_win, shared_editor_buf)
   assert(vim.bo[state.activity.buf].filetype == "activity_bar", "Activity Bar buffer has the wrong filetype")
   assert(vim.api.nvim_win_get_width(activity_win) == 3, "Activity Bar is not exactly three columns")
-  assert(#normal_windows() == 4, "default layout does not have exactly four normal windows")
+  -- The sidebar is a column: the pinned paths above, the file tree below.
+  local pinned_win = assert(require("config.pinned")._panel(), "the Explorer opened without its pinned paths").win
+  assert(#normal_windows() == 5, "default layout does not have exactly five normal windows")
   assert(
     vim.deep_equal(vim.fn.winlayout(), {
       "row",
       {
         { "leaf", activity_win },
-        { "leaf", explorer_win },
+        { "col", { { "leaf", pinned_win }, { "leaf", explorer_win } } },
         { "col", { { "leaf", editor_win }, { "leaf", terminal_win } } },
       },
     }),

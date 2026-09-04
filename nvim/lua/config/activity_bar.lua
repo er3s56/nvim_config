@@ -656,6 +656,7 @@ local function destroy_content(state)
   if not content then
     return
   end
+  require("config.pinned").detach()
   state.closing = content
   state.content = nil
   if content.kind == "git" and content.git_state then
@@ -917,9 +918,23 @@ local function arrange_activity(state, root)
   local activity_position = vim.api.nvim_win_get_position(state.activity.win)
   local root_position = vim.api.nvim_win_get_position(root)
   local expected_root_col = activity_position[2] + vim.api.nvim_win_get_width(state.activity.win) + 1
-  local aligned = root_position[1] == activity_position[1]
+  -- The sidebar is a column, and the root is not always all of it: the pinned
+  -- paths stack above it. Measuring the root's own height against the Activity
+  -- Bar would call a settled sidebar misaligned and move it, which drops
+  -- whatever else was stacked in that column out of the sidebar entirely.
+  local column_top, column_bottom = root_position[1], root_position[1] + vim.api.nvim_win_get_height(root)
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(state.tab)) do
+    if vim.api.nvim_win_get_config(win).relative == "" then
+      local position = vim.api.nvim_win_get_position(win)
+      if position[2] == root_position[2] and vim.api.nvim_win_get_width(win) == vim.api.nvim_win_get_width(root) then
+        column_top = math.min(column_top, position[1])
+        column_bottom = math.max(column_bottom, position[1] + vim.api.nvim_win_get_height(win))
+      end
+    end
+  end
+  local aligned = column_top == activity_position[1]
     and root_position[2] == expected_root_col
-    and vim.api.nvim_win_get_height(root) == vim.api.nvim_win_get_height(state.activity.win)
+    and column_bottom - column_top == vim.api.nvim_win_get_height(state.activity.win)
   local ok, result = true, 0
   if not aligned then
     ok, result = pcall(vim.fn.win_splitmove, root, state.activity.win, {
@@ -1042,6 +1057,12 @@ local function finish_open(state, generation, width, focus)
       return
     end
     restore_placement(state, root, width)
+    -- The pinned paths sit above the file tree, and only there. Created here,
+    -- once the sidebar column has settled: made any earlier, the swap's own
+    -- rearranging carries the new window off to the edge of the tab.
+    if content.kind == "explorer" then
+      require("config.pinned").attach(root, state.root, content.picker)
+    end
     if content.picker then
       disable_picker_quit(content.picker)
       refine_picker_mouse(content.picker)
@@ -1530,6 +1551,10 @@ function M.reflow(tab)
     end)
   end
   pcall(require("config.git_panel").reflow_layout)
+  -- The pinned paths take their rows out of the file tree, and the Picker
+  -- keeps its own count of how tall its list is. This is where the heights
+  -- finally settle, so this is where it has to be told.
+  pcall(require("config.pinned").resync)
   sync_tabline_offset()
   -- Scrollbars follow the sidebar swap in the next tick or two rather than
   -- trailing it by scrollview's own deferred autocmd schedule.

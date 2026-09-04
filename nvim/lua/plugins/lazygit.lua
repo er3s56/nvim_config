@@ -71,6 +71,30 @@ return {
           ActivityBar.close()
         end
       end, { desc = "Close the project Git sidebar" })
+      command("Pin", function(opts)
+        local Pinned = require("config.pinned")
+        local path = opts.args ~= "" and opts.args or vim.api.nvim_buf_get_name(0)
+        if path == "" then
+          vim.notify("Nothing to pin: this buffer has no file", vim.log.levels.WARN)
+          return
+        end
+        local root = Pinned.project_root()
+        if Pinned.add(root, path) then
+          vim.notify("Pinned " .. vim.fn.fnamemodify(path, ":~"))
+        else
+          vim.notify("Already pinned", vim.log.levels.WARN)
+        end
+      end, { desc = "Pin a path to the project sidebar", nargs = "?", complete = "file" })
+      command("Unpin", function(opts)
+        local Pinned = require("config.pinned")
+        local path = opts.args ~= "" and opts.args or vim.api.nvim_buf_get_name(0)
+        local root = Pinned.project_root()
+        if Pinned.remove(root, path) then
+          vim.notify("Unpinned " .. vim.fn.fnamemodify(path, ":~"))
+        else
+          vim.notify("That path is not pinned", vim.log.levels.WARN)
+        end
+      end, { desc = "Remove a path from the project sidebar", nargs = "?", complete = "file" })
       command("PanelOpen", function()
         ActivityBar.open_all_panels()
       end, { desc = "Restore the Activity Bar, sidebar, and project terminal" })

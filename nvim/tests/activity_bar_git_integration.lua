@@ -114,6 +114,7 @@ local ok, test_error = pcall(function()
   )
 
   local sidebar = assert(ActivityBar._content_root(state.content))
+  local pinned = assert(require("config.pinned")._panel(), "the Explorer opened without its pinned paths").win
   local active_terminal_group = assert(TerminalTabs._groups[TerminalTabs._normalize_root(root)])
   local terminal_win = active_terminal_group.active.terminal.win
   assert(
@@ -121,7 +122,7 @@ local ok, test_error = pcall(function()
       "row",
       {
         { "leaf", state.activity.win },
-        { "leaf", sidebar },
+        { "col", { { "leaf", pinned }, { "leaf", sidebar } } },
         {
           "col",
           {
