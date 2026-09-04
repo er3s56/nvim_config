@@ -403,6 +403,52 @@ local ok, test_error = pcall(function()
   deliver("<LeftMouse>", assert(ActivityBar.editor_window()), 1)
   assert(deliver("<LeftDrag>", sidebar_win, 1) == "", "a drag inside the panel can select its text again")
 
+  -- ── a drag past the minimum asks for the minimum ─────────────────────
+  -- Dragging the border in one motion from wide to narrow overshoots, and an
+  -- overshoot used to throw the whole gesture away: the next reflow -- which
+  -- any window event brings along -- put the width back where it started, so
+  -- the sidebar could only be shrunk a little at a time.
+  local sidebar = assert(ActivityBar._content_root(state.content))
+  state.sidebar_width = 120
+  ActivityBar.reflow(state.tab)
+  assert(
+    vim.wait(3000, function()
+      return vim.api.nvim_win_get_width(sidebar) == 120
+    end),
+    "the sidebar would not go wide to begin with"
+  )
+
+  -- Where a drag past the left edge leaves the window, before anything reads it.
+  vim.wo[sidebar].winfixwidth = false
+  vim.api.nvim_win_set_width(sidebar, 12)
+  ActivityBar._adopt_dragged_width()
+  assert(
+    vim.wait(3000, function()
+      return vim.api.nvim_win_get_width(sidebar) == 28
+    end),
+    "a drag past the minimum did not settle at the minimum: "
+      .. vim.api.nvim_win_get_width(sidebar)
+  )
+  ActivityBar.reflow(state.tab)
+  assert(
+    vim.wait(3000, function()
+      return vim.api.nvim_win_get_width(sidebar) == 28
+    end),
+    "the sidebar sprang back to the width the drag started from"
+  )
+
+  -- And a drag that stops short of the minimum is taken as it is.
+  vim.wo[sidebar].winfixwidth = false
+  vim.api.nvim_win_set_width(sidebar, 55)
+  ActivityBar._adopt_dragged_width()
+  ActivityBar.reflow(state.tab)
+  assert(
+    vim.wait(3000, function()
+      return vim.api.nvim_win_get_width(sidebar) == 55
+    end),
+    "an ordinary drag was not kept"
+  )
+
   -- Losing the Activity Bar column must take its sidebar down with it.
   local tab = state.tab
   vim.api.nvim_win_close(state.activity.win, true)

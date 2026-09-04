@@ -1302,6 +1302,30 @@ end
 -- down, and the next press recomputes this.
 local border_gesture = false
 
+--- Take the width a border drag ended at as the width that was asked for.
+---
+--- A drag that went past the sidebar's minimum is a request for the minimum,
+--- not a gesture to be discarded: read as a width to adopt it fails the "not
+--- narrower than the minimum" test, and the next reflow -- which any window
+--- event brings along -- put the old width back. Dragged from wide to narrow
+--- in one motion, the sidebar sprang back to where it started, and only
+--- shortening it a little at a time worked.
+function M._adopt_dragged_width(tab)
+  local state = state_for(tab, false)
+  -- A sidebar that is closing, collapsed or hidden has no content and so no
+  -- window to have been dragged; the one check covers all of it.
+  local root = state and content_root(state.content)
+  if not valid_win(root) then
+    return
+  end
+  local wanted = math.max(vim.api.nvim_win_get_width(root), MIN_SIDEBAR_WIDTH)
+  if wanted == state.sidebar_width then
+    return
+  end
+  state.sidebar_width = wanted
+  M.reflow(state.tab)
+end
+
 function M._note_press(mouse)
   border_gesture = mouse ~= nil and (mouse.line or 0) < 1
   return border_gesture
@@ -1675,6 +1699,11 @@ function M.setup()
     vim.keymap.set({ "n", "x", "i", "t" }, key, function()
       local mouse = vim.fn.getmousepos()
       if border_gesture then
+        if key == "<LeftRelease>" then
+          -- Neovim resizes on the release itself, so the result is only there
+          -- to be read on the next tick.
+          vim.schedule(M._adopt_dragged_width)
+        end
         return key
       end
       -- A selection dragged out in the terminal is finished on the release:
