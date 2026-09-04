@@ -101,9 +101,15 @@ end
 
 local function refresh_terminals()
   sweep()
+  -- The list is taken once and walked, and the walk closes windows: a bar
+  -- belonging to a window that stopped being a terminal is dropped, and its
+  -- float is in the very list being walked. An id read later in the same loop
+  -- can therefore be gone, which is what the single-window version below has
+  -- always checked for.
   for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
     if
-      vim.api.nvim_win_get_config(win).relative == ""
+      vim.api.nvim_win_is_valid(win)
+      and vim.api.nvim_win_get_config(win).relative == ""
       and vim.bo[vim.api.nvim_win_get_buf(win)].buftype == "terminal"
     then
       refresh_terminal(win)

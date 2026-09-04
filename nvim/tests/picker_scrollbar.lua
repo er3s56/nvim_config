@@ -241,6 +241,46 @@ local ok, test_error = pcall(function()
   vim.wait(500)
   assert(vim.fn.line("w0", term_win) == settled, "the terminal view snapped back after the drag")
 
+  -- ── a bar closed mid-walk does not take the walk down with it ─────────
+  -- The refresh takes the tab's window list once and walks it, and the walk
+  -- closes windows: a terminal too short to carry a bar has its bar dropped,
+  -- and that bar is a float in the very list being walked -- listed after the
+  -- terminals, so it is read again once it is gone. That is what raised
+  -- "Invalid window id" out of a scheduled callback, with nothing on screen to
+  -- say why.
+  local pair = {}
+  for _ = 1, 2 do
+    vim.cmd("botright 8new")
+    pair[#pair + 1] = vim.api.nvim_get_current_win()
+    vim.fn.jobstart({ "seq", "1", "400" }, { term = true })
+  end
+  assert(
+    vim.wait(6000, function()
+      Scrollbar._refresh_terminals()
+      for _, win in ipairs(pair) do
+        local bar = Scrollbar._bars[win]
+        if not bar or not vim.api.nvim_win_is_valid(bar.win) then
+          return false
+        end
+      end
+      return true
+    end),
+    "the two terminals did not both get a scrollbar"
+  )
+  -- One row leaves no room for a bar, so the next walk drops it part way.
+  vim.api.nvim_win_set_height(pair[1], 1)
+  local walked, why = pcall(Scrollbar._refresh_terminals)
+  assert(walked, "refreshing terminals errored when a bar closed during the walk: " .. tostring(why))
+  assert(Scrollbar._bars[pair[1]] == nil, "the bar of a terminal with no room was kept")
+  local survivor = Scrollbar._bars[pair[2]]
+  assert(
+    survivor and vim.api.nvim_win_is_valid(survivor.win),
+    "dropping one terminal's bar took the other's with it"
+  )
+  for _, win in ipairs(pair) do
+    pcall(vim.api.nvim_win_close, win, true)
+  end
+
   vim.api.nvim_win_close(term_win, true)
   assert(
     vim.wait(3000, function()
