@@ -267,7 +267,12 @@ local function paste_files(ctx)
 end
 
 local function copy_text(paths, label)
-  local ok, err = pcall(vim.fn.setreg, "+", table.concat(paths, "\n"), "l")
+  -- Charwise, not linewise: a linewise register carries a trailing newline
+  -- into the system clipboard, and under WSL that clipboard is the Windows
+  -- one -- so a copied path pasted at a shell prompt runs the moment it
+  -- lands. Several paths still arrive one per line; only the trailing
+  -- newline goes away.
+  local ok, err = pcall(vim.fn.setreg, "+", table.concat(paths, "\n"), "c")
   if not ok then
     error_message(("Failed to copy %s:\n%s"):format(label, err or "unknown error"))
     return
