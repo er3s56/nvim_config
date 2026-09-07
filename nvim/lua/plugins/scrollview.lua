@@ -36,6 +36,39 @@ return {
     },
     config = function(_, opts)
       require("scrollview").setup(opts)
+      -- Mark where the changes are on the scrollbar itself, the way an
+      -- overview ruler does: scrolled away from a hunk you can still see that
+      -- one is there, and roughly how far down.
+      --
+      -- The marks come from a contrib module that has to be set up after
+      -- gitsigns, and gitsigns is not loaded when this runs -- scrollview
+      -- arrives on VeryLazy, gitsigns only once a real file is open, so on a
+      -- dashboard start this would otherwise wire itself to nothing and say
+      -- so to no one. Take whichever of the two moments comes second.
+      local function attach_gitsigns()
+        if not package.loaded["gitsigns"] then
+          return false
+        end
+        local ok, err = pcall(function()
+          require("scrollview.contrib.gitsigns").setup({})
+        end)
+        if not ok then
+          vim.notify(("Scrollbar git marks are unavailable: %s"):format(err), vim.log.levels.WARN)
+        end
+        return true
+      end
+
+      if not attach_gitsigns() then
+        vim.api.nvim_create_autocmd("User", {
+          group = vim.api.nvim_create_augroup("project_scrollview_gitsigns", { clear = true }),
+          pattern = "LazyLoad",
+          callback = function(args)
+            if args.data == "gitsigns.nvim" then
+              return attach_gitsigns()
+            end
+          end,
+        })
+      end
       -- The default handle links to Visual, which Solarized Light renders as
       -- a pale pink barely distinguishable from the background. Use the
       -- palette's content greys instead: base1 for the handle, base01 while
