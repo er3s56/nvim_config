@@ -5,7 +5,24 @@ assert(rawget(_G, "Snacks") and Snacks.terminal, "Snacks must be loaded by the r
 local root = vim.fn.tempname()
 vim.fn.mkdir(root, "p")
 root = TerminalTabs._normalize_root(root)
-local original_select = vim.ui.select
+-- Terminations are confirmed through the shared context menu, so a test
+-- answers one by picking the row it wants out of the entry list.
+local ContextMenu = require("config.context_menu")
+local original_menu_open = ContextMenu.open
+local last_prompt
+
+local function answer_confirm(label)
+  last_prompt = nil
+  ContextMenu.open = function(entries, _, _)
+    last_prompt = entries[1] and entries[1].label
+    for _, entry in ipairs(entries) do
+      if entry.label == label and type(entry.action) == "function" then
+        entry.action()
+        return
+      end
+    end
+  end
+end
 local starting_tab = vim.api.nvim_get_current_tabpage()
 local extra_tab
 
@@ -22,9 +39,7 @@ local function visible_count()
 end
 
 local function select_item(action)
-  vim.ui.select = function(_, _, callback)
-    callback(action)
-  end
+  answer_confirm(action)
 end
 
 local function window_geometry(terminal_win)
@@ -223,11 +238,7 @@ local ok, test_error = pcall(function()
   assert(vim.api.nvim_get_current_tabpage() == starting_tab, "integration test did not return to its original tab")
   TerminalTabs.open(root, false)
 
-  local prompt
-  vim.ui.select = function(_, opts, callback)
-    prompt = opts.prompt
-    callback("Cancel")
-  end
+  answer_confirm("Cancel")
   TerminalTabs.render(second.win)
   local close_id
   for id, target in ipairs(TerminalTabs._click_targets[second.buf]) do
@@ -244,11 +255,11 @@ local ok, test_error = pcall(function()
   vim.b[second.buf].term_title = "two"
   assert(
     vim.wait(1000, function()
-      return prompt ~= nil
+      return last_prompt ~= nil
     end),
     "clicking a terminal close button did not show confirmation"
   )
-  assert(prompt:find("two", 1, true), "close confirmation omitted the current terminal title")
+  assert(last_prompt:find("two", 1, true), "close confirmation omitted the current terminal title")
   assert(#group().items == 4 and group().active.terminal == second, "cancelling close changed terminal state")
 
   select_item("Terminate")
@@ -350,7 +361,7 @@ local ok, test_error = pcall(function()
   )
 end)
 
-vim.ui.select = original_select
+ContextMenu.open = original_menu_open
 if extra_tab and vim.api.nvim_tabpage_is_valid(extra_tab) then
   pcall(vim.api.nvim_set_current_tabpage, extra_tab)
   pcall(vim.cmd.tabclose)

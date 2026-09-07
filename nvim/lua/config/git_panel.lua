@@ -2664,15 +2664,10 @@ local function cursor_mouse(state)
 end
 
 local function confirm(state, prompt, label, mouse, proceed)
-  ContextMenu.open({
-    { label = prompt, enabled = false },
-    { separator = true },
-    { label = label, action = proceed },
-    { label = "Cancel", action = function() end },
-  }, mouse or cursor_mouse(state), {
-    filetype = "git_panel_confirm",
-    min_width = math.min(vim.api.nvim_strwidth(prompt) + 4, math.max(vim.o.columns - 4, 20)),
-  })
+  -- The panel keeps its own cursor fallback: a keyboard-driven confirmation
+  -- here belongs over the panel row it acts on, not over whatever window
+  -- happens to be current.
+  ContextMenu.confirm(prompt, label, mouse or cursor_mouse(state), proceed, { filetype = "git_panel_confirm" })
 end
 
 -- Discarding is the one action here that destroys work no git command can

@@ -57,12 +57,26 @@ function M.dismiss(mouse)
   return true
 end
 
+-- A menu opens under the pointer. Callers reached by keyboard have no pointer,
+-- so fall back to the cursor: the menu still lands on the row the action is
+-- about, which is what the pointer would have pointed at anyway.
+local function cursor_mouse()
+  local win = vim.api.nvim_get_current_win()
+  local line = vim.api.nvim_win_get_cursor(win)[1]
+  local position = vim.fn.screenpos(win, line, 1)
+  return {
+    screenrow = position.row > 0 and position.row or 1,
+    screencol = position.col > 0 and position.col or 1,
+  }
+end
+
 function M.open(entries, mouse, opts)
   M.close()
   if not entries or #entries == 0 then
     return
   end
   opts = opts or {}
+  mouse = mouse or cursor_mouse()
 
   local lines, width = {}, 1
   for _, entry in ipairs(entries) do
@@ -138,11 +152,21 @@ function M.open(entries, mouse, opts)
     vim.schedule(entry.action)
   end
 
+  -- Which row the menu opens on is a safety decision, not a cosmetic one: it
+  -- is the row <CR> runs. An entry may claim it with `default = true`;
+  -- otherwise the first selectable row keeps it, as menus have always done.
+  local focused
   for index = 1, #entries do
     if selectable(index) then
-      vim.api.nvim_win_set_cursor(win, { index, 0 })
-      break
+      if entries[index].default then
+        focused = index
+        break
+      end
+      focused = focused or index
     end
+  end
+  if focused then
+    vim.api.nvim_win_set_cursor(win, { focused, 0 })
   end
 
   local map_opts = { buffer = buf, silent = true, nowait = true }
@@ -168,8 +192,11 @@ function M.open(entries, mouse, opts)
     vim.schedule(M.close)
     return ""
   end, vim.tbl_extend("force", map_opts, { expr = true }))
-  map_many({ "<LeftMouse>" }, function()
-    local position = vim.fn.getmousepos()
+  -- What a left press on this menu means. Kept apart from the mapping, and
+  -- hung on the open menu, so the contract every confirmation in this
+  -- configuration relies on -- one press on a row runs that row -- can be
+  -- asserted without a pointer to press with.
+  local function press(position)
     if position.winid == win and position.line >= 1 and position.line <= #entries then
       vim.schedule(function()
         if not (active_menu and active_menu.win == win and vim.api.nvim_win_is_valid(win)) then
@@ -188,6 +215,11 @@ function M.open(entries, mouse, opts)
     else
       vim.schedule(M.close)
     end
+  end
+  active_menu.press = press
+
+  map_many({ "<LeftMouse>" }, function()
+    press(vim.fn.getmousepos())
     return ""
   end, vim.tbl_extend("force", map_opts, { expr = true }))
   map_many({ "<LeftRelease>", "<RightRelease>" }, "<Nop>")
@@ -203,6 +235,64 @@ function M.open(entries, mouse, opts)
       end)
     end,
   })
+end
+
+-- The one way this configuration asks a yes/no question.
+--
+-- Every panel here is driven by single clicks -- a click on a menu row runs
+-- that row -- so a confirmation has to answer to the same gesture. Neither
+-- `vim.ui.select` nor the snacks picker confirm does: in a picker a lone click
+-- moves the cursor and nothing else, so the second click of a natural "click
+-- Delete, click Yes" lands on a dialog that ignores it and says nothing.
+-- Building the dialog out of menu entries makes a confirmation the same widget
+-- as the menu that raised it, which is also how it inherits the menu keys:
+-- <CR> chooses, j/k move, <Esc> and a right click dismiss.
+--
+-- Reach for this rather than a picker whenever the question is a choice; the
+-- test suite fails a module that reaches past it.
+---@param prompt string Question shown as the disabled first row.
+---@param label string Label of the row that proceeds.
+---@param mouse table|nil Pointer position; the cursor stands in when nil.
+---@param proceed function Runs when the proceeding row is chosen.
+---@param opts table|nil `filetype` for the dialog window.
+function M.confirm(prompt, label, mouse, proceed, opts)
+  opts = opts or {}
+  -- Cancel is the row that opens focused, so <CR> on a confirmation declines
+  -- it.
+  --
+  -- Every question asked through here is destructive -- trash a file, kill a
+  -- terminal, throw away a change git cannot bring back -- and the two ways a
+  -- stray <CR> can land are not worth the same. Answering "no" by accident
+  -- costs one keystroke to redo. Answering "yes" by accident costs work, and
+  -- for a discard costs it permanently. A dialog that exists because the
+  -- action is dangerous should not arrive with the dangerous row already
+  -- chosen.
+  --
+  -- This is a menu, and menus here focus their first row, so a confirmation is
+  -- deliberately the exception. It also costs the Git panel the old `x` then
+  -- <CR> rhythm, where `x` is the vim key for deleting a character and so is a
+  -- plausible slip in the first place.
+  M.open({
+    { label = prompt, enabled = false },
+    { separator = true },
+    { label = label, action = proceed },
+    { label = "Cancel", action = function() end, default = true },
+  }, mouse, {
+    filetype = opts.filetype or "confirm_menu",
+    min_width = math.min(vim.api.nvim_strwidth(prompt) + 4, math.max(vim.o.columns - 4, 20)),
+  })
+end
+
+-- Test seam for the press contract: the window a press must name, and the
+-- press itself. Nothing in the configuration calls these.
+function M._window()
+  return active_menu and active_menu.win
+end
+
+function M._press(position)
+  if active_menu and active_menu.press then
+    active_menu.press(position)
+  end
 end
 
 function M.register(name, handler)

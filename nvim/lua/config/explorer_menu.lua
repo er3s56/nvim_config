@@ -145,8 +145,8 @@ local function refresh(picker, target, dirs)
   require("config.git_panel").refresh_all()
 end
 
-local function confirm(prompt, callback)
-  Snacks.picker.util.confirm(prompt, callback)
+local function confirm(ctx, prompt, label, callback)
+  ContextMenu.confirm(prompt, label, ctx and ctx.mouse, callback, { filetype = "explorer_confirm" })
 end
 
 local function input_name(prompt, callback)
@@ -254,10 +254,12 @@ local function paste_files(ctx)
   end
   local suffix = #plan.conflicts > #preview and (" and %d more"):format(#plan.conflicts - #preview) or ""
   confirm(
+    ctx,
     ("Destination already contains %s%s. Merge folders and overwrite conflicting items?"):format(
       table.concat(preview, ", "),
       suffix
     ),
+    "Merge and Overwrite",
     function()
       perform_paste(ctx, plan, true)
     end
@@ -361,7 +363,7 @@ end
 
 local function delete_items(ctx)
   local what = #ctx.paths == 1 and vim.fs.basename(ctx.paths[1]) or ("%d items"):format(#ctx.paths)
-  confirm(("Move %s to the system trash?"):format(what), function()
+  confirm(ctx, ("Move %s to the system trash?"):format(what), "Move to Trash", function()
     local trashed, failed, errors = {}, {}, {}
     if Platform.trash_available() then
       for _, path in ipairs(ctx.paths) do
@@ -387,9 +389,14 @@ local function delete_items(ctx)
 
     warn("Some items could not be moved to the system trash:\n" .. table.concat(errors, "\n"))
     local failed_what = #failed == 1 and vim.fs.basename(failed[1]) or ("%d items"):format(#failed)
-    confirm(("Trash unavailable. Permanently delete %s? This cannot be undone."):format(failed_what), function()
-      permanently_delete(ctx, failed)
-    end)
+    confirm(
+      ctx,
+      ("Trash unavailable. Permanently delete %s? This cannot be undone."):format(failed_what),
+      "Delete Permanently",
+      function()
+        permanently_delete(ctx, failed)
+      end
+    )
   end)
 end
 

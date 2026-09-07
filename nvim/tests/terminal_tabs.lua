@@ -14,8 +14,27 @@ root = TerminalTabs._normalize_root(root)
 other_root = TerminalTabs._normalize_root(other_root)
 
 local original_open = Snacks.terminal.open
-local original_select = vim.ui.select
 local original_buf = vim.api.nvim_get_current_buf()
+
+-- Terminations are confirmed through the shared context menu, so a test
+-- answers one by picking the row it wants out of the entry list.
+local ContextMenu = require("config.context_menu")
+local original_menu_open = ContextMenu.open
+local last_prompt
+
+local function answer_confirm(label)
+  last_prompt = nil
+  ContextMenu.open = function(entries, _, _)
+    last_prompt = entries[1] and entries[1].label
+    for _, entry in ipairs(entries) do
+      if entry.label == label and type(entry.action) == "function" then
+        entry.action()
+        return
+      end
+    end
+  end
+end
+
 local created = {}
 
 local function fake_open(_, opts)
@@ -112,18 +131,12 @@ local ok, test_error = pcall(function()
   assert_equal(before_right_click, #group.items, "a non-left winbar click changed terminal state")
   vim.api.nvim_win_set_buf(0, original_buf)
 
-  local prompt
-  vim.ui.select = function(_, opts, callback)
-    prompt = opts.prompt
-    callback("Cancel")
-  end
+  answer_confirm("Cancel")
   TerminalTabs.confirm_close(root, group.items[1])
-  assert(prompt:find("build 100%% 中文"), "termination confirmation did not include the terminal title")
+  assert(last_prompt:find("build 100%% 中文"), "termination confirmation did not include the terminal title")
   assert_equal(2, #group.items, "cancelling termination changed the terminal group")
 
-  vim.ui.select = function(_, _, callback)
-    callback("Terminate")
-  end
+  answer_confirm("Terminate")
   TerminalTabs.confirm_close(root, 1)
   assert_equal(
     { 2 },
@@ -146,7 +159,7 @@ local ok, test_error = pcall(function()
 end)
 
 Snacks.terminal.open = original_open
-vim.ui.select = original_select
+ContextMenu.open = original_menu_open
 if vim.api.nvim_buf_is_valid(original_buf) then
   pcall(vim.api.nvim_win_set_buf, 0, original_buf)
 end

@@ -26,7 +26,6 @@ end
 
 vim.cmd.PanelOpen()
 local root = TerminalTabs._normalize_root(LazyVim.root())
-local original_select = vim.ui.select
 local shared_editor_buf
 local ok, test_error = pcall(function()
   assert(wait_for_view("explorer"), "default Explorer sidebar did not become ready")
@@ -309,7 +308,6 @@ local ok, test_error = pcall(function()
   end
 end)
 
-vim.ui.select = original_select
 local terminal_group = TerminalTabs._groups[root]
 if terminal_group then
   for _, item in ipairs(terminal_group.items) do

@@ -1,3 +1,4 @@
+local ContextMenu = require("config.context_menu")
 local PanelLayout = require("config.panel_layout")
 local WinOptions = require("config.win_options")
 
@@ -673,7 +674,7 @@ function M.switch(root, wanted, focus)
   return show_item(group, item, focus ~= false)
 end
 
-function M.confirm_close(root, wanted)
+function M.confirm_close(root, wanted, mouse)
   local group = group_for(root, false)
   local _, item = item_index(group, wanted)
   if not item then
@@ -682,13 +683,12 @@ function M.confirm_close(root, wanted)
 
   local focus = item.terminal:win_valid() and vim.api.nvim_get_current_win() == item.terminal.win
   local title = terminal_title(item)
-  vim.ui.select({ "Terminate", "Cancel" }, {
-    prompt = ('Terminate terminal "%s"?'):format(title),
-  }, function(choice)
-    if choice == "Terminate" and item_index(group, item) then
+  ContextMenu.confirm(('Terminate terminal "%s"?'):format(title), "Terminate", mouse, function()
+    -- The group can have moved on while the dialog stood open.
+    if item_index(group, item) then
       remove_item(group, item, { terminate = true, focus = focus })
     end
-  end)
+  end, { filetype = "terminal_tabs_confirm" })
 end
 
 function M.page(root, direction)
@@ -880,7 +880,7 @@ function M.click(minwid, _, button, _, win)
     elseif target.action == "switch" then
       M.switch(target.root, target.item, true)
     elseif target.action == "close" then
-      M.confirm_close(target.root, target.item)
+      M.confirm_close(target.root, target.item, mouse)
     elseif target.action == "page" then
       M.page(target.root, target.direction)
     end
