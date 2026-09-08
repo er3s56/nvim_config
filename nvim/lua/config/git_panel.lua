@@ -394,7 +394,13 @@ local function render(state)
           truncate(branch.ref, room),
           suffix
         ),
-        branch.current and "Title" or nil,
+        -- Three ranks share this list: the branch you are on, the branches
+        -- you are not, and the commits beneath them. Leaving the others
+        -- uncoloured gave them the body colour the commit subjects already
+        -- carry, so a branch name and a commit subject read alike and the
+        -- list flattened into one stream. Colour marks them as branches; the
+        -- stronger Title, and the bullet, still say which one is current.
+        branch.current and "Title" or "Special",
         { kind = "branch", ref = branch.ref, current = branch.current }
       )
       if collapsed then
