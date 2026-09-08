@@ -1938,28 +1938,127 @@ local function hunk_actions(mode)
   return {}
 end
 
-local function prepare_hunks(preview)
-  preview.hunks = {}
-  preview.hunk_marks = {}
-  if #hunk_actions(preview.mode) == 0 then
-    return
-  end
+-- Whether the lines on screen are the lines a hunk would be computed from.
+local function hunks_describe_screen(preview)
   -- A side that was never read has no lines to stage: what is in the buffer
   -- is a sentence about the file, not the file.
   if preview.skipped then
-    return
+    return false
   end
   -- Nor while the file has unsaved changes. The hunks are computed from what
   -- is on disk, git can only stage what is on disk, and the lines on screen
-  -- are neither -- buttons drawn against them would point at the wrong text
-  -- and refuse when pressed.
+  -- are neither -- anything drawn against them would point at the wrong text.
   if preview.after_is_file and vim.bo[preview.bufs[2]].modified then
-    return
+    return false
   end
   if GitOps.is_binary(preview.before) or GitOps.is_binary(preview.after) then
+    return false
+  end
+  return true
+end
+
+-- Mark on each diff scrollbar where that side's changes are.
+--
+-- The rail for a file being edited comes from gitsigns, which only ever
+-- attaches to files in the work tree. Both sides of this view are `nofile`
+-- buffers holding text git printed, so gitsigns never sees them and a commit
+-- read here had a bare slider: no way to tell, scrolled into the middle of a
+-- large file, whether the next change is a screen away or a thousand lines.
+--
+-- The hunks are already in hand, so this only has to hand their line numbers
+-- to the scrollbar. Each side gets its own: a deletion occupies lines on the
+-- before side and none on the after, and marking it on both would put a mark
+-- where that side has nothing to show.
+local RAIL_GROUP = "git_panel_diff"
+local rail_specs
+
+local function rail_ready()
+  if rail_specs ~= nil then
+    return rail_specs
+  end
+  local ok, scrollview = pcall(require, "scrollview")
+  if not ok then
+    rail_specs = false
+    return false
+  end
+  local built = {}
+  local ok_register = pcall(function()
+    scrollview.register_sign_group(RAIL_GROUP)
+    for _, spec in ipairs({
+      { variant = "add", highlight = "GitSignsAdd", symbol = "▎" },
+      { variant = "change", highlight = "GitSignsChange", symbol = "▎" },
+      { variant = "remove", highlight = "GitSignsDelete", symbol = "▎" },
+      -- Where this side has no lines at all the mark cannot sit on one; a
+      -- block on the boundary reads as "between these", which is where it
+      -- happened.
+      { variant = "gap", highlight = "GitSignsDelete", symbol = "▁" },
+    }) do
+      built[spec.variant] = scrollview.register_sign_spec({
+        group = RAIL_GROUP,
+        highlight = spec.highlight,
+        symbol = spec.symbol,
+        variant = spec.variant,
+        -- A hunk covering many lines draws as a bar rather than a single
+        -- tick, which is what makes its extent readable at a glance.
+        extend = true,
+      }).name
+    end
+    scrollview.set_sign_group_state(RAIL_GROUP, true)
+  end)
+  rail_specs = ok_register and built or false
+  return rail_specs
+end
+
+local function paint_rail(preview, hunks)
+  local specs = rail_ready()
+  if not specs or not preview.bufs then
     return
   end
-  preview.hunks = GitOps.hunks(preview.before, preview.after)
+  local sides = {
+    { buf = preview.bufs[1], earlier = true, start_key = "before_start", count_key = "before_count" },
+    { buf = preview.bufs[2], earlier = false, start_key = "after_start", count_key = "after_count" },
+  }
+  for _, side in ipairs(sides) do
+    local lines = { add = {}, change = {}, remove = {}, gap = {} }
+    if side.buf and vim.api.nvim_buf_is_valid(side.buf) then
+      local total = vim.api.nvim_buf_line_count(side.buf)
+      for _, hunk in ipairs(hunks) do
+        local start, count = hunk[side.start_key], hunk[side.count_key]
+        local other = side.earlier and hunk.after_count or hunk.before_count
+        if count == 0 then
+          -- Nothing of this hunk lives on this side, so the mark belongs on
+          -- the line it happened after.
+          lines.gap[#lines.gap + 1] = math.max(1, math.min(start, total))
+        else
+          -- Lines only this side has are a removal when this side is the
+          -- earlier one and an addition when it is the later one. The hunk
+          -- does not say which; the pane does.
+          local kind = "change"
+          if other == 0 then
+            kind = side.earlier and "remove" or "add"
+          end
+          for line = start, math.min(start + count - 1, total) do
+            lines[kind][#lines[kind] + 1] = line
+          end
+        end
+      end
+      -- Assigned even when empty: these buffers outlive one file, and a rail
+      -- still carrying the last one's marks is worse than a bare one.
+      for variant, name in pairs(specs) do
+        vim.b[side.buf][name] = lines[variant]
+      end
+    end
+  end
+  vim.cmd("silent! ScrollViewRefresh")
+end
+
+local function prepare_hunks(preview)
+  preview.hunk_marks = {}
+  local hunks = hunks_describe_screen(preview) and GitOps.hunks(preview.before, preview.after) or {}
+  -- The buttons are only for hunks that can still be moved; a commit's are
+  -- history. The scrollbar marks them either way -- reading is not staging.
+  preview.hunks = #hunk_actions(preview.mode) > 0 and hunks or {}
+  paint_rail(preview, hunks)
 end
 
 -- The buttons are virtual text at the end of the hunk's first line: the diff
