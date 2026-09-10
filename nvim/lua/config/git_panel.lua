@@ -2129,6 +2129,12 @@ local function hunk_button_at(state, preview, mouse)
   end
 end
 
+-- A path as a buffer name spells it: `/` would have Neovim read the name as a
+-- tree of directories, and a newline would end the line the name is shown on.
+local function path_label(path)
+  return (path:gsub("/", "›"):gsub("[\r\n]", " "))
+end
+
 local function show_preview(state, entry, key, before, after, specs, focus_preview)
   if not valid(state) then
     return
@@ -2145,11 +2151,14 @@ local function show_preview(state, entry, key, before, after, specs, focus_previ
   state.preview_serial = state.preview_serial + 1
   local serial = state.preview_serial
   local source = entry.kind == "commit_file" and entry.short_hash or "CHANGES"
-  local path_label = entry.path:gsub("/", "›"):gsub("[\r\n]", " ")
-  local tab_label = ("Δ %s · %s"):format(path_label, source)
-  local before_name = ("git-preview://%d/%d/before/%s"):format(state.buf, serial, path_label)
+  local tab_label = ("Δ %s · %s"):format(path_label(entry.path), source)
+  -- The left pane holds the file as it was, which for a rename is a different
+  -- path from the one the row is filed under. Naming that buffer after the row
+  -- would leave two different files claiming the same name.
+  local before_path = specs.before_path or entry.path
+  local before_name = ("git-preview://%d/%d/before/%s"):format(state.buf, serial, path_label(before_path))
   local after_name = ("git-diff://%d/%d/%s"):format(state.buf, serial, tab_label)
-  local before_buf = preview_buffer(false, before_name, entry.old_path or entry.path, before, specs.skipped)
+  local before_buf = preview_buffer(false, before_name, before_path, before, specs.skipped)
   -- The working-tree side is the file, not a copy of it. That is what makes
   -- the diff editable: what is on the right is the buffer the editor would
   -- have opened, so it can be changed, written, and undone like any other.
@@ -2297,17 +2306,36 @@ local function read_blob(root, spec, callback)
   end)
 end
 
+-- Whether a row is a rename, and if so where the file came from. Git reports a
+-- copy the same way, and for the panel it reads the same: one path became
+-- another.
+local function renamed_from(entry)
+  local old = entry.old_path
+  if not old or old == "" or old == entry.path then
+    return nil
+  end
+  return old
+end
+
+-- A rename's two sides are two different files, and only the "before" side
+-- still holds the name the file used to have.
+local function with_old_name(label, old)
+  return old and (label .. " · " .. (old:gsub("[\r\n]", " "))) or label
+end
+
 -- What a row's diff compares, and what that makes it: an edit still in flight
 -- (which can be staged, unstaged or thrown away) or a piece of history.
 local function preview_specs(entry)
   local status = entry.status
   if entry.kind == "commit_file" then
     local code = status:sub(1, 1)
+    local old = renamed_from(entry)
     return {
       mode = "commit",
-      before_spec = code ~= "A" and (entry.commit .. "^1:" .. (entry.old_path or entry.path)) or nil,
+      before_path = old,
+      before_spec = code ~= "A" and (entry.commit .. "^1:" .. (old or entry.path)) or nil,
       after_spec = code ~= "D" and (entry.commit .. ":" .. entry.path) or nil,
-      before_label = "Before · " .. entry.short_hash .. "^",
+      before_label = with_old_name("Before · " .. entry.short_hash .. "^", old),
       after_label = "After · " .. entry.short_hash,
     }
   end
@@ -2335,11 +2363,13 @@ local function preview_specs(entry)
       after_label = "After · worktree",
     }
   end
+  local old = renamed_from(entry)
   return {
     mode = "staged",
-    before_spec = index_status ~= "A" and ("HEAD:" .. (entry.old_path or entry.path)) or nil,
+    before_path = old,
+    before_spec = index_status ~= "A" and ("HEAD:" .. (old or entry.path)) or nil,
     after_spec = index_status ~= "D" and (":" .. entry.path) or nil,
-    before_label = "Before · HEAD",
+    before_label = with_old_name("Before · HEAD", old),
     after_label = "After · index",
   }
 end
@@ -2462,7 +2492,7 @@ function reload_preview(state, preview, entry)
     if not changed then
       return
     end
-    set_preview_content(preview.bufs[1], entry.old_path or entry.path, before, specs.skipped)
+    set_preview_content(preview.bufs[1], specs.before_path or entry.path, before, specs.skipped)
     -- Never the working-tree side when it is the file itself: it may hold
     -- edits that have not been written, and Neovim re-diffs it as they are
     -- typed anyway.
