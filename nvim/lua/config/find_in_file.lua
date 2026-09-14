@@ -16,10 +16,12 @@
 -- there and leaves the strip open for the next.
 local ActivityBar = require("config.activity_bar")
 local TerminalTabs = require("config.terminal_tabs")
+local WinOptions = require("config.win_options")
 
 local M = {}
 
-local HEIGHT = 12
+-- A row of switches, a row to type in, and nine rows of matches.
+local HEIGHT = 13
 local STATE = "find_in_file"
 -- Buffer changes arrive in bursts -- a sidebar previewing files under the
 -- pointer swaps the editor's buffer on every row -- and a strip folded and
@@ -122,7 +124,7 @@ local function layout(dock)
       border = "top",
       title = " {title} {live} {flags}",
       title_pos = "left",
-      { win = "input", height = 1, border = "bottom" },
+      { win = "input", height = 2, border = "bottom" },
       { win = "list", border = "none" },
       -- Hidden while the preview is drawn over the editor, but the layout is
       -- expected to declare it all the same.
@@ -158,6 +160,71 @@ local function restore_row(picker, saved)
   end
 end
 
+-- The switches: match case, whole word, regex. Kept for the session rather
+-- than per buffer, the way an editor keeps them -- a query that had to be
+-- whole-word in one file usually has to be in the next.
+local flags = { case = false, word = false, regex = false }
+
+local function matcher_opts()
+  return { regex = flags.regex, ignorecase = not flags.case, smartcase = not flags.case }
+end
+
+-- The query as the matcher should see it. Whole word, and case under regex,
+-- have no option in the matcher but do have a syntax: a plain term becomes
+-- 'term' for whole word, and a regex is anchored with \< \> and prefixed \c
+-- or \C. A term already carrying a modifier is left as typed.
+local function rewrite(pattern)
+  if flags.regex then
+    if pattern == "" then
+      return pattern
+    end
+    local sensitive = flags.case or pattern:lower() ~= pattern
+    if flags.word then
+      pattern = "\\<\\%(" .. pattern .. "\\)\\>"
+    end
+    return (sensitive and "\\C" or "\\c") .. pattern
+  end
+  if not flags.word then
+    return pattern
+  end
+  local terms = {}
+  for _, term in ipairs(vim.split(pattern, " +", { trimempty = true })) do
+    if term == "|" or term:find("^[!'^]") or term:sub(-1) == "$" then
+      terms[#terms + 1] = term
+    else
+      terms[#terms + 1] = "'" .. term .. "'"
+    end
+  end
+  return table.concat(terms, " ")
+end
+
+local function flags_winbar()
+  return ActivityBar.flags_winbar(flags, "FindInFileFlagClick", 0)
+end
+
+-- Search again with the switches as they are now, and redraw them. The
+-- matcher parses a query once and keeps the result while the query reads the
+-- same; a switch that changes only the options behind it has to make it
+-- parse again. The winbar goes into the window's own options too, which is
+-- where Snacks reads it back from on the next layout.
+local function apply_flags(strip)
+  local picker = strip.picker
+  if not alive(picker) then
+    return
+  end
+  for name, value in pairs(matcher_opts()) do
+    picker.matcher.opts[name] = value
+  end
+  picker.matcher:init("")
+  picker.list:set_target()
+  picker:find()
+  local winbar = flags_winbar()
+  picker.input.win.opts.wo.winbar = winbar
+  if picker.input.win:valid() then
+    WinOptions.set(picker.input.win.win, { winbar = winbar })
+  end
+end
+
 local function open(strip, opts)
   local buf, main = strip.buf, strip.main
   local saved = remembered(buf) or {}
@@ -168,6 +235,12 @@ local function open(strip, opts)
     title = "Find in File",
     pattern = opts.pattern or saved.pattern or "",
     enter = opts.enter == true,
+    matcher = matcher_opts(),
+    filter = {
+      transform = function(_, filter)
+        filter.pattern = rewrite(filter.pattern)
+      end,
+    },
     auto_close = false,
     -- A query that matches nothing is still a query being typed. The strip
     -- stays up and says so, rather than vanishing under the reader's hands.
@@ -178,12 +251,14 @@ local function open(strip, opts)
     layout = layout(dock),
     win = {
       input = {
-        keys = {
+        keys = vim.tbl_extend("force", ActivityBar.SEARCH_FLAG_KEYS, {
           -- Esc closes from Insert mode too. This is a find box, not a prompt
           -- with a Normal mode worth stopping in on the way out.
           ["<Esc>"] = { "cancel", mode = { "n", "i" } },
-        },
+        }),
+        wo = { winbar = flags_winbar() },
       },
+      list = { keys = ActivityBar.SEARCH_FLAG_KEYS },
     },
     -- Only an unfolding strip goes back to its row. One opened by Ctrl+F is
     -- a fresh search, and starts at the top.
@@ -373,6 +448,27 @@ function M.open_selection()
   M.open(#lines == 1 and lines[1] or nil)
 end
 
+--- Flip one of the switches -- "case", "word" or "regex" -- and search again
+--- with it in the strip of the current tab, if one is up.
+function M.toggle(name)
+  flags[name] = not flags[name]
+  local strip = strips[vim.api.nvim_get_current_tabpage()]
+  if strip then
+    apply_flags(strip)
+  end
+end
+
+_G.FindInFileFlagClick = function(minwid, _, button)
+  if button == "l" or button == "left" then
+    vim.schedule(function()
+      local flag = ActivityBar.SEARCH_FLAGS[tonumber(minwid) or 0]
+      if flag then
+        M.toggle(flag.name)
+      end
+    end)
+  end
+end
+
 --- Close the strip in the current tab, the way Esc would.
 function M.close()
   local strip = strips[vim.api.nvim_get_current_tabpage()]
@@ -421,6 +517,7 @@ function M.setup()
 end
 
 M._strips = strips
+M._flags = flags
 M._searchable = searchable
 M._resized = on_win_resized
 

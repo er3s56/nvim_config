@@ -440,7 +440,7 @@ local function create_activity(tab)
     generation = 0,
     editor_win = created.editor ~= win and created.editor or nil,
     activity = { win = win, buf = buf },
-    search = { query = "", hidden = false, cursor = 1, top = 1 },
+    search = { query = "", hidden = false, case = false, word = false, regex = false, cursor = 1, top = 1 },
     explorer = { cursor = 1, top = 1 },
   }
   states[tab] = state
@@ -760,10 +760,51 @@ local function restore_list_position(state, picker, saved, generation, remember_
   end
 end
 
+-- The three switches an editor find box has -- match case, whole word, regex
+-- -- shared with the Find in File strip so both read and toggle alike. They
+-- are buttons only. Snacks binds <a-r> to a regex toggle of its own that
+-- would flip the mode behind the button; unbinding it is not enough, since
+-- an Alt key with no mapping is read as Esc and the key, and Alt+R in the
+-- input would leave Insert mode and start a replace. It does nothing instead.
+M.SEARCH_FLAGS = {
+  { name = "case", label = "Aa" },
+  { name = "word", label = "ab" },
+  { name = "regex", label = ".*" },
+}
+M.SEARCH_FLAG_KEYS = {
+  ["<a-r>"] = { function() end, mode = { "i", "n" }, desc = "Regex is a button in this search" },
+}
+
+--- The switches as winbar buttons, right-aligned and lit while on. A click
+--- reaches `click` with `base` plus the position of the switch.
+function M.flags_winbar(flags, click, base)
+  local parts = { "%=" }
+  for index, flag in ipairs(M.SEARCH_FLAGS) do
+    local highlight = flags[flag.name] and "SnacksPickerToggle" or "Comment"
+    parts[#parts + 1] = ("%%#%s#%%%d@v:lua.%s@ %s %%X%%* "):format(highlight, base + index, click, flag.label)
+  end
+  return table.concat(parts)
+end
+
+-- What the switches add to rg. Case stays smart until forced: a query with a
+-- capital in it already distinguishes case, and the switch is for the
+-- all-lowercase one that has to.
+local function search_args(flags)
+  local args = {}
+  if flags.case then
+    args[#args + 1] = "-s"
+  end
+  if flags.word then
+    args[#args + 1] = "-w"
+  end
+  return args
+end
+
 local function search_winbar(state, enabled)
   local highlight = enabled and "SnacksPickerToggleHidden" or "Comment"
   local label = enabled and " 󰈈 Hidden: on " or " 󰈉 Hidden: off "
   return ("%%#%s#%%%d@v:lua.ActivityBarSearchHiddenClick@%s%%X%%*"):format(highlight, state.tab, label)
+    .. M.flags_winbar(state.search, "ActivityBarSearchFlagClick", state.tab * 10)
 end
 
 local function set_search_winbar(state, picker, attempt)
@@ -862,6 +903,10 @@ local function open_search(state, width, generation)
     search = state.search.query or "",
     hidden = state.search.hidden == true,
     ignored = false,
+    -- The switches. Regex is off until asked for, so a query is what was
+    -- typed: `foo.bar` finds `foo.bar`, not `fooXbar` as well.
+    regex = state.search.regex == true,
+    args = search_args(state.search),
     auto_close = false,
     enter = false,
     -- A Bufferline tab is a listed buffer, not a Neovim tabpage. Keep the
@@ -872,8 +917,10 @@ local function open_search(state, width, generation)
     title = "Search",
     win = {
       input = {
+        keys = M.SEARCH_FLAG_KEYS,
         wo = { winbar = search_winbar(state, state.search.hidden == true) },
       },
+      list = { keys = M.SEARCH_FLAG_KEYS },
     },
   })
   if not picker then
@@ -1261,6 +1308,26 @@ function M.toggle_search_hidden(tab)
   end
   picker:action("toggle_hidden")
   state.search.hidden = picker.opts.hidden == true
+  set_search_winbar(state, picker)
+end
+
+--- Flip one of the Search switches -- "case", "word" or "regex" -- for `tab`
+--- and search again with it. The state is kept even while the sidebar shows
+--- something else, so a switch set once stays set for the tab.
+function M.toggle_search_flag(tab, name)
+  local state = state_for(tab, false)
+  if not state then
+    return
+  end
+  state.search[name] = not state.search[name]
+  local picker = state.content and state.content.kind == "search" and state.content.picker or nil
+  if not picker or picker.closed then
+    return
+  end
+  picker.opts.args = search_args(state.search)
+  picker.opts.regex = state.search.regex == true
+  picker.list:set_target()
+  picker:find()
   set_search_winbar(state, picker)
 end
 
@@ -1882,6 +1949,20 @@ _G.ActivityBarSearchHiddenClick = function(minwid, _, button)
   if button == "l" or button == "left" then
     vim.schedule(function()
       M.toggle_search_hidden(tonumber(minwid))
+    end)
+  end
+end
+
+-- The winbar carries one number per button: the tab, times ten, plus the
+-- position of the switch.
+_G.ActivityBarSearchFlagClick = function(minwid, _, button)
+  if button == "l" or button == "left" then
+    vim.schedule(function()
+      local id = tonumber(minwid) or 0
+      local flag = M.SEARCH_FLAGS[id % 10]
+      if flag then
+        M.toggle_search_flag(math.floor(id / 10), flag.name)
+      end
     end)
   end
 end
