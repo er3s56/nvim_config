@@ -465,7 +465,8 @@ local function state_for(tab, create)
   return state
 end
 
-local function disable_picker_quit(picker)
+-- The keys a sidebar panel answers itself, on the buffers Snacks gave it.
+local function bind_panel_keys(picker)
   if not picker then
     return
   end
@@ -486,6 +487,15 @@ local function disable_picker_quit(picker)
         buffer = buf,
         silent = true,
         desc = "Leave Insert mode without closing the panel",
+      })
+      -- Ctrl+B hides the sidebar from inside it, as it does from the editor
+      -- (config/keymaps.lua). Snacks has it scroll the preview instead.
+      vim.keymap.set({ "n", "i" }, "<C-b>", function()
+        M.close()
+      end, {
+        buffer = buf,
+        silent = true,
+        desc = "Hide the sidebar",
       })
     end
   end
@@ -875,7 +885,7 @@ local function open_explorer(state, width, generation)
   end
   stabilize_picker_close(picker)
   picker:show()
-  disable_picker_quit(picker)
+  bind_panel_keys(picker)
   refine_picker_mouse(picker)
   picker.main = editor
   return { kind = "explorer", picker = picker }
@@ -928,7 +938,7 @@ local function open_search(state, width, generation)
   end
   stabilize_picker_close(picker)
   picker:show()
-  disable_picker_quit(picker)
+  bind_panel_keys(picker)
   refine_picker_mouse(picker)
   disable_search_ignored(picker)
   picker.main = editor
@@ -1123,7 +1133,7 @@ local function finish_open(state, generation, width, focus)
       require("config.pinned").attach(root, state.root, content.picker)
     end
     if content.picker then
-      disable_picker_quit(content.picker)
+      bind_panel_keys(content.picker)
       refine_picker_mouse(content.picker)
       -- The opener runs before state.content is assigned. Restore only after
       -- this picker has been mounted, and let the finder finish before
@@ -1236,6 +1246,26 @@ function M.open(view, opts)
   end
   replace_view(state, view, opts.focus ~= false)
   return state
+end
+
+--- Open the Search sidebar with `query` in its box, or with the query it had.
+--- A picker being built reads the query off the tab state, and one already
+--- up is told directly.
+function M.search(query, opts)
+  opts = opts or {}
+  local state = state_for(opts.tab, true)
+  if not state then
+    return
+  end
+  if query and query ~= "" then
+    state.search.query = query
+    local picker = state.content and state.content.kind == "search" and state.content.picker or nil
+    if picker and not picker.closed then
+      picker.input:set(nil, query)
+      picker:find()
+    end
+  end
+  return M.open("search", opts)
 end
 
 function M.close(opts)

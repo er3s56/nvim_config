@@ -3773,6 +3773,19 @@ function M.open_terminal(focus)
   return TerminalTabs.open(LazyVim.root(), focus)
 end
 
+-- The terminal key an editor has: bring the terminal up and into focus, or,
+-- when the focus is already in it, put it away. The terminal being left
+-- names its own root; asking the project for one from inside a scratch
+-- buffer can name another.
+function M.toggle_terminal()
+  local managed, root = TerminalTabs.owns_buffer(vim.api.nvim_get_current_buf())
+  if managed then
+    TerminalTabs.hide(root)
+    return
+  end
+  M.open_terminal(true)
+end
+
 function M.open_all_panels()
   local explorer = M.open_explorer(false)
   if explorer then
