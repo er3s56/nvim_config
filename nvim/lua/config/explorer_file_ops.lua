@@ -141,7 +141,91 @@ local function remove_path(path)
   return true
 end
 
-local function copy_path(from, to, overwrite)
+local copy_path
+
+local function remove_staging(path)
+  -- Copied directories may deliberately be read-only. These are our own
+  -- temporary entries (or an already-replaced backup), so make directories
+  -- removable without following any symlinks out of this staging tree.
+  local function writable(dir)
+    local stat = uv.fs_lstat(dir)
+    if not stat or stat.type ~= "directory" then
+      return
+    end
+    uv.fs_chmod(dir, bit.bor(stat.mode, 448))
+    for _, name in ipairs(scandir(dir) or {}) do
+      writable(vim.fs.joinpath(dir, name))
+    end
+  end
+  writable(path)
+  return remove_path(path)
+end
+
+-- Read the replacement completely before touching the old destination. Copy
+-- failures (permissions, full disk, a broken link) must leave the old item
+-- available. A sibling staging directory keeps the final rename on one device.
+local function replace_path(from, to)
+  local staging, stage_err = uv.fs_mkdtemp(vim.fs.joinpath(vim.fs.dirname(to), ".nvim-copy-XXXXXX"))
+  if not staging then
+    return nil, ("Cannot prepare replacement for `%s`:\n%s"):format(to, stage_err or "unknown error")
+  end
+  local candidate, backup = vim.fs.joinpath(staging, "item"), vim.fs.joinpath(staging, "previous")
+  local copied, copy_err = copy_path(from, candidate, false)
+  if not copied then
+    remove_staging(staging)
+    return nil, copy_err
+  end
+  local source, destination = uv.fs_lstat(candidate), uv.fs_lstat(to)
+  if source.type == "directory" then
+    -- Moving a directory between parents can require write access to update
+    -- its parent link. Restore the requested mode at its final location.
+    local ready, mode_err = uv.fs_chmod(candidate, bit.bor(source.mode, 448))
+    if not ready then
+      remove_staging(staging)
+      return nil, mode_err
+    end
+  end
+  local held = destination and (source.type == "directory" or destination.type == "directory")
+  if held then
+    local moved, move_err = uv.fs_rename(to, backup)
+    if not moved then
+      remove_staging(staging)
+      return nil, ("Cannot replace `%s`:\n%s"):format(to, move_err or "unknown error")
+    end
+  end
+  local installed, install_err = uv.fs_rename(candidate, to)
+  if not installed then
+    if held then
+      local restored, restore_err = uv.fs_rename(backup, to)
+      if not restored then
+        return nil,
+          ("Replacement failed; the original is preserved at `%s`:\n%s\n%s"):format(
+            backup,
+            install_err or "",
+            restore_err or ""
+          )
+      end
+    end
+    remove_staging(staging)
+    return nil, ("Cannot replace `%s`:\n%s"):format(to, install_err or "unknown error")
+  end
+  if source.type == "directory" then
+    local restored, mode_err = uv.fs_chmod(to, source.mode)
+    if not restored then
+      vim.notify(
+        "Copy completed, but directory permissions could not be restored: " .. tostring(mode_err),
+        vim.log.levels.WARN
+      )
+    end
+  end
+  local cleaned, cleanup_err = remove_staging(staging)
+  if not cleaned then
+    vim.notify("Copy completed, but its temporary backup could not be removed: " .. cleanup_err, vim.log.levels.WARN)
+  end
+  return true
+end
+
+copy_path = function(from, to, overwrite)
   local source, stat_err = uv.fs_lstat(from)
   if not source then
     return nil, ("Cannot read `%s`:\n%s"):format(from, stat_err or "unknown error")
@@ -153,14 +237,13 @@ local function copy_path(from, to, overwrite)
       if not overwrite then
         return nil, ("Destination already exists: `%s`"):format(to)
       end
-      local ok, err = remove_path(to)
-      if not ok then
-        return nil, err
-      end
-      destination = nil
+      return replace_path(from, to)
     end
+    local created = not destination
     if not destination then
-      local ok, err = uv.fs_mkdir(to, source.mode or 493)
+      -- A readable source directory can be read-only. Keep its new copy
+      -- writable until all children have arrived, then restore its mode.
+      local ok, err = uv.fs_mkdir(to, 448)
       if not ok and not uv.fs_stat(to) then
         return nil, ("Cannot create directory `%s`:\n%s"):format(to, err or "unknown error")
       end
@@ -178,6 +261,12 @@ local function copy_path(from, to, overwrite)
         return nil, err
       end
     end
+    if created then
+      local ok, err = uv.fs_chmod(to, source.mode or 493)
+      if not ok then
+        return nil, ("Cannot set directory permissions on `%s`:\n%s"):format(to, err or "unknown error")
+      end
+    end
     return true
   end
 
@@ -188,10 +277,7 @@ local function copy_path(from, to, overwrite)
     if not overwrite then
       return nil, ("Destination already exists: `%s`"):format(to)
     end
-    local ok, err = remove_path(to)
-    if not ok then
-      return nil, err
-    end
+    return replace_path(from, to)
   end
 
   local parent = vim.fs.dirname(to)
