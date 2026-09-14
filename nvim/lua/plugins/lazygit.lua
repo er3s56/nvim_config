@@ -79,9 +79,10 @@ return {
           return
         end
         local root = Pinned.project_root()
-        if Pinned.add(root, path) then
+        local added, err = Pinned.add(root, path)
+        if added then
           vim.notify("Pinned " .. vim.fn.fnamemodify(path, ":~"))
-        else
+        elseif not err then
           vim.notify("Already pinned", vim.log.levels.WARN)
         end
       end, { desc = "Pin a path to the project sidebar", nargs = "?", complete = "file" })
@@ -89,9 +90,10 @@ return {
         local Pinned = require("config.pinned")
         local path = opts.args ~= "" and opts.args or vim.api.nvim_buf_get_name(0)
         local root = Pinned.project_root()
-        if Pinned.remove(root, path) then
+        local removed, err = Pinned.remove(root, path)
+        if removed then
           vim.notify("Unpinned " .. vim.fn.fnamemodify(path, ":~"))
-        else
+        elseif not err then
           vim.notify("That path is not pinned", vim.log.levels.WARN)
         end
       end, { desc = "Remove a path from the project sidebar", nargs = "?", complete = "file" })

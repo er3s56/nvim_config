@@ -13,6 +13,7 @@
 
 local ContextMenu = require("config.context_menu")
 local WinOptions = require("config.win_options")
+local uv = vim.uv
 
 local M = {}
 
@@ -20,6 +21,7 @@ local MAX_ROWS = 8
 local ns = vim.api.nvim_create_namespace("project_pinned")
 
 local store
+local store_error
 local panel
 local collapsed = false
 
@@ -40,14 +42,13 @@ local function normalize(path)
   if not path or path == "" then
     return nil
   end
-  return (vim.fs.normalize(vim.fn.fnamemodify(path, ":p")):gsub("/+$", ""))
+  path = vim.fs.normalize(vim.fn.fnamemodify(path, ":p"))
+  return path == "/" and path or (path:gsub("/+$", ""))
 end
 
 local function load_store()
-  if store then
-    return store
-  end
   store = {}
+  store_error = nil
   local file = io.open(store_file(), "r")
   if file then
     local text = file:read("*a")
@@ -67,7 +68,11 @@ local function load_store()
           store[root] = kept
         end
       end
+    else
+      store_error = "The pinned paths file is not valid JSON; repair it before saving: " .. store_file()
     end
+  elseif uv.fs_stat(store_file()) then
+    store_error = "Cannot read the pinned paths file: " .. store_file()
   end
   return store
 end
@@ -75,14 +80,92 @@ end
 local function save_store()
   local ok, encoded = pcall(vim.json.encode, store or {})
   if not ok then
-    return
+    return nil, tostring(encoded)
   end
-  local file = io.open(store_file(), "w")
-  if not file then
-    return
+  local fd, temporary = uv.fs_mkstemp(store_file() .. ".XXXXXX")
+  if not fd then
+    return nil, temporary
   end
-  file:write(encoded)
-  file:close()
+  local written, write_err = uv.fs_write(fd, encoded, 0)
+  local synced, sync_err = uv.fs_fsync(fd)
+  local closed, close_err = uv.fs_close(fd)
+  if written ~= #encoded or not synced or not closed then
+    uv.fs_unlink(temporary)
+    return nil, write_err or sync_err or close_err or "Incomplete pinned paths write"
+  end
+  local renamed, rename_err = uv.fs_rename(temporary, store_file())
+  if not renamed then
+    uv.fs_unlink(temporary)
+    return nil, rename_err
+  end
+  return true
+end
+
+local function mutate_store(change)
+  local path = store_file()
+  vim.fn.mkdir(vim.fs.dirname(path), "p")
+  local lock = path .. ".lock"
+  local fd, lock_err = uv.fs_open(lock, "wx", 384)
+  if not fd then
+    -- Recover a lock left by a terminated Neovim, but never a live writer.
+    local previous = uv.fs_lstat(lock)
+    local readable, lines = pcall(vim.fn.readfile, lock)
+    local owner = readable and tonumber(lines[1])
+    local alive, signal_err
+    if owner and owner > 0 then
+      alive, signal_err = uv.kill(owner, 0)
+    end
+    local current = uv.fs_lstat(lock)
+    if
+      previous
+      and current
+      and previous.ino == current.ino
+      and previous.dev == current.dev
+      and not alive
+      and signal_err
+      and signal_err:match("^ESRCH:")
+    then
+      uv.fs_unlink(lock)
+      fd, lock_err = uv.fs_open(lock, "wx", 384)
+    end
+  end
+  if not fd then
+    return nil, "Pinned paths are busy or not writable: " .. tostring(lock_err)
+  end
+  local owner = tostring(uv.os_getpid()) .. "\n"
+  local written, write_err = uv.fs_write(fd, owner, 0)
+  local ok, changed, err = pcall(function()
+    if written ~= #owner then
+      return nil, write_err or "Could not record pinned paths lock owner"
+    end
+    -- Re-read while holding the lock, so saving one project cannot erase
+    -- pins just saved by another session.
+    load_store()
+    if store_error then
+      return nil, store_error
+    end
+    if not change() then
+      return false
+    end
+    local saved, save_err = save_store()
+    return saved, save_err
+  end)
+  uv.fs_close(fd)
+  uv.fs_unlink(lock)
+  store = nil
+  if not ok then
+    return nil, tostring(changed)
+  end
+  return changed, err
+end
+
+local function finish_change(changed, err)
+  if err then
+    vim.notify("Cannot save pinned paths: " .. err, vim.log.levels.ERROR)
+  elseif changed then
+    M.render()
+  end
+  return changed, err
 end
 
 --- The project a path belongs to, the same way the rest of the sidebar
@@ -117,15 +200,18 @@ end
 
 function M.add(root, path)
   root, path = normalize(root), normalize(path)
-  if not root or not path or M.is_pinned(root, path) then
+  if not root or not path then
     return false
   end
-  local paths = load_store()[root] or {}
-  paths[#paths + 1] = path
-  store[root] = paths
-  save_store()
-  M.render()
-  return true
+  return finish_change(mutate_store(function()
+    local paths = store[root] or {}
+    if vim.tbl_contains(paths, path) then
+      return false
+    end
+    paths[#paths + 1] = path
+    store[root] = paths
+    return true
+  end))
 end
 
 function M.remove(root, path)
@@ -133,22 +219,22 @@ function M.remove(root, path)
   if not root or not path then
     return false
   end
-  local paths = load_store()[root]
-  if not paths then
-    return false
-  end
-  for index, pinned in ipairs(paths) do
-    if pinned == path then
-      table.remove(paths, index)
-      if #paths == 0 then
-        store[root] = nil
-      end
-      save_store()
-      M.render()
-      return true
+  return finish_change(mutate_store(function()
+    local paths = store[root]
+    if not paths then
+      return false
     end
-  end
-  return false
+    for index, pinned in ipairs(paths) do
+      if pinned == path then
+        table.remove(paths, index)
+        if #paths == 0 then
+          store[root] = nil
+        end
+        return true
+      end
+    end
+    return false
+  end))
 end
 
 -- ── what a row says ─────────────────────────────────────────────────────
