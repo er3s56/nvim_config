@@ -10,3 +10,9 @@ end, { desc = "Find in file" })
 vim.keymap.set("x", "<C-f>", function()
   require("config.find_in_file").open_selection()
 end, { desc = "Find selection in file" })
+-- From Insert mode too, the way an editor find box opens mid-typing. Insert
+-- mode carries over into the strip and ends when the strip closes, which
+-- leaves the editor in Normal mode with the cursor where Esc would put it.
+vim.keymap.set("i", "<C-f>", function()
+  require("config.find_in_file").open()
+end, { desc = "Find in file" })

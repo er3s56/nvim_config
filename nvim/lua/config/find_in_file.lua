@@ -142,24 +142,14 @@ local function snapshot(picker)
   return fields
 end
 
--- Put the list back on the row it was on. Called when the picker is shown,
--- which for a picker that is not live is once, after its matcher has
--- finished: the rows are all there and nobody has moved among them yet.
--- Polling for the matcher instead lost both ways -- asked too early there was
--- nothing to restore into, asked too late it put the row back under a
--- selection already made. Only a picker shown early by `show_delay`, on a
--- buffer large enough to keep the matcher busy, is still worth waiting for.
-local function restore_row(picker, saved, attempt)
-  attempt = attempt or 0
-  if not alive(picker) then
-    return
-  end
-  if picker:is_active() then
-    if attempt < 50 then
-      vim.defer_fn(function()
-        restore_row(picker, saved, attempt + 1)
-      end, 30)
-    end
+-- Put the list back on the row it was on. Called when an unfolding strip is
+-- shown, which Snacks does once its matcher has finished: the rows are all
+-- there and nobody has moved among them yet. Polling for the matcher instead
+-- lost both ways -- asked too early there was nothing to restore into, asked
+-- too late it put the row back under a selection already made. A picker that
+-- `show_delay` put up before its matcher was done is left alone.
+local function restore_row(picker, saved)
+  if not alive(picker) or picker:is_active() then
     return
   end
   local count = picker.list:count()
@@ -171,7 +161,6 @@ end
 local function open(strip, opts)
   local buf, main = strip.buf, strip.main
   local saved = remembered(buf) or {}
-  local row = { cursor = opts.cursor or saved.cursor, top = opts.top or saved.top }
   local dock = open_dock(main)
   strip.dock = dock
   local picker = Snacks.picker.lines({
@@ -196,9 +185,11 @@ local function open(strip, opts)
         },
       },
     },
+    -- Only an unfolding strip goes back to its row. One opened by Ctrl+F is
+    -- a fresh search, and starts at the top.
     on_show = function(shown)
-      if strip.picker == shown then
-        restore_row(shown, row)
+      if strip.picker == shown and not opts.enter then
+        restore_row(shown, saved)
       end
     end,
     on_close = function(closing)
@@ -232,6 +223,13 @@ local function open(strip, opts)
   end
   strip.picker = picker
   picker.main = main
+  -- Snacks shows a picker on the tick after its results arrive. Keys typed
+  -- before then go to the window that still has the focus -- the editor, in
+  -- Normal mode, where a query like `dd` is a command. When the strip is
+  -- opened to be typed into, it takes the focus before this returns.
+  if opts.enter then
+    picker:show()
+  end
   for _, window in pairs({ picker.input.win, picker.list.win }) do
     ActivityBar.disable_selection_gestures(window.buf)
   end

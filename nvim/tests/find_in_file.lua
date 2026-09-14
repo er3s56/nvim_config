@@ -62,13 +62,15 @@ local ok, test_error = pcall(function()
   assert(not FindInFile._searchable(terminal_win), "the terminal counted as searchable")
   assert(FindInFile._searchable(editor), "the editor did not count as searchable")
 
-  -- Open on a.txt with a query.
+  -- Open on a.txt with a query. The focus moves before this returns: keys
+  -- typed right after Ctrl+F must land in the strip, not in the editor.
   vim.api.nvim_set_current_win(editor)
   FindInFile.open("needle")
+  local first = assert(picker(), "Ctrl+F did not open a strip")
+  assert(vim.api.nvim_get_current_win() == first.input.win.win, "the input was not focused synchronously")
   wait(3000, settled(3), "the strip did not list the three matching lines")
-  local first = assert(picker())
+  assert(picker() == first, "the strip was replaced while its results arrived")
   assert(first.main == editor, "the strip does not preview into the editor window")
-  assert(vim.api.nvim_get_current_win() == first.input.win.win, "opening did not focus the input")
   assert(vim.b[buf_a].find_in_file.open == true, "a.txt does not remember an open strip")
 
   -- Docked to the editor: same left edge, same width, directly beneath it, and
@@ -207,10 +209,12 @@ local ok, test_error = pcall(function()
   end, "closing by hand left the dock behind")
   assert(vim.api.nvim_win_is_valid(editor), "closing the strip took the editor with it")
 
-  -- Closing the dock window itself, as :q in it would, closes the strip.
+  -- Closing the dock window itself, as :q in it would, closes the strip. A
+  -- strip reopened by Ctrl+F starts at the top: only unfolding restores a row.
   vim.api.nvim_set_current_win(editor)
   FindInFile.open("needle")
   wait(3000, settled(3), "reopening on a.txt did not list its matches")
+  assert(picker().list.cursor == 1, "a strip reopened by Ctrl+F did not start at the top")
   local fourth_dock = assert(strip().dock)
   vim.api.nvim_win_close(fourth_dock, true)
   wait(3000, function()
