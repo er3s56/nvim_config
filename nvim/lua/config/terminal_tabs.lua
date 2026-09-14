@@ -586,6 +586,10 @@ function M.new(root, focus)
     cwd = group.root,
     count = number,
     auto_close = false,
+    -- Focus is handled below after the host window is mounted. Snacks'
+    -- separate start_insert default can otherwise leave a pending :startinsert
+    -- that runs after an unfocused creation has restored the editor window.
+    start_insert = false,
     win = {
       position = host_win and "current" or "bottom",
       height = 0.3,

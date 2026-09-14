@@ -509,6 +509,19 @@ local function stabilize_picker_close(picker)
   end
   local original_close = picker.close
   picker._activity_close = original_close
+  -- Snacks clears win.win inside WinClosed, then removes its augroup on the
+  -- next tick. Its VimResized list callback has no validity guard, so remove
+  -- that callback before closing the window. Reopening registers it again.
+  local list_window = picker.list and picker.list.win
+  if list_window then
+    local close_window = list_window.close
+    list_window.close = function(self, ...)
+      if self.augroup then
+        pcall(vim.api.nvim_clear_autocmds, { group = self.augroup, event = "VimResized" })
+      end
+      return close_window(self, ...)
+    end
+  end
   picker.close = function(self)
     if self.closed or self._activity_closing then
       return
@@ -725,7 +738,8 @@ local function restore_list_position(state, picker, saved, generation, remember_
   then
     return
   end
-  if picker.list and picker.list:count() > 0 then
+  local active = picker:is_active()
+  if not active and picker.list and picker.list:count() > 0 then
     local cursor = math.min(saved.cursor or 1, picker.list:count())
     if remember_file and saved.file then
       for index = 1, picker.list:count() do
@@ -739,7 +753,7 @@ local function restore_list_position(state, picker, saved, generation, remember_
     picker.list:view(cursor, saved.top or 1, true)
     return
   end
-  if attempt < 50 then
+  if active or attempt < 50 then
     vim.defer_fn(function()
       restore_list_position(state, picker, saved, generation, remember_file, attempt + 1)
     end, 30)
@@ -823,7 +837,6 @@ local function open_explorer(state, width, generation)
   disable_picker_quit(picker)
   refine_picker_mouse(picker)
   picker.main = editor
-  restore_list_position(state, picker, state.explorer, generation, true)
   return { kind = "explorer", picker = picker }
 end
 
@@ -873,7 +886,6 @@ local function open_search(state, width, generation)
   disable_search_ignored(picker)
   picker.main = editor
   set_search_winbar(state, picker)
-  restore_list_position(state, picker, state.search, generation, false)
   return { kind = "search", picker = picker }
 end
 
@@ -1066,6 +1078,14 @@ local function finish_open(state, generation, width, focus)
     if content.picker then
       disable_picker_quit(content.picker)
       refine_picker_mouse(content.picker)
+      -- The opener runs before state.content is assigned. Restore only after
+      -- this picker has been mounted, and let the finder finish before
+      -- clamping the saved cursor to its final result count.
+      local explorer = content.kind == "explorer"
+      local saved = vim.deepcopy(explorer and state.explorer or state.search)
+      vim.schedule(function()
+        restore_list_position(state, content.picker, saved, generation, explorer)
+      end)
     end
     if content.kind == "search" and content.picker then
       disable_search_ignored(content.picker)
@@ -1417,6 +1437,8 @@ local function arrange_terminal(state)
   -- leaves the terminal at Neovim's minimum height, which must not be mistaken
   -- for a height the user chose.
   local before = vim.api.nvim_win_get_height(terminal)
+  local terminal_view = vim.api.nvim_win_call(terminal, vim.fn.winsaveview)
+  local changed = false
   local terminal_pos = vim.api.nvim_win_get_position(terminal)
   local editor_pos = vim.api.nvim_win_get_position(editor)
   -- The terminal spans the editor area, which is not always one window: a Git
@@ -1436,6 +1458,7 @@ local function arrange_terminal(state)
     end
   end
   if terminal_pos[2] ~= area_left or vim.api.nvim_win_get_width(terminal) ~= area_right - area_left then
+    changed = true
     local fixed = vim.wo[terminal].winfixheight
     WinOptions.set(terminal, { winfixheight = false })
     pcall(vim.fn.win_splitmove, terminal, editor, { vertical = false, rightbelow = true })
@@ -1462,6 +1485,7 @@ local function arrange_terminal(state)
     end
     local target = math.max(minimum, math.min(desired, math.max(1, total - editor_minimum)))
     if target ~= current then
+      changed = true
       WinOptions.set(terminal, { winfixheight = false })
       pcall(vim.api.nvim_win_set_height, terminal, target)
       if valid_win(terminal) then
@@ -1469,6 +1493,13 @@ local function arrange_terminal(state)
       end
     end
     state.terminal_height = target
+  end
+  if changed and valid_win(terminal) then
+    -- A split move can advance topline even when no terminal output moved.
+    -- Keep the user's viewport, including a fresh shell's first-line prompt.
+    vim.api.nvim_win_call(terminal, function()
+      vim.fn.winrestview(terminal_view)
+    end)
   end
 end
 
