@@ -16,6 +16,7 @@ return {
       require("config.picker_scrollbar").setup()
       local ActivityBar = require("config.activity_bar")
       ActivityBar.setup()
+      require("config.find_in_file").setup()
 
       local function command(name, callback, opts)
         opts = opts or {}

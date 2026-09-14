@@ -1355,11 +1355,12 @@ function M._dragging_border()
   return border_gesture
 end
 
-function M._handle_list_click(mouse)
-  local state = state_for(tab_for_win(mouse and mouse.winid), false)
-  local picker = state and state.content and state.content.picker or nil
+--- Confirm the row of `picker`'s list under a press, if the press is on one.
+--- Any picker's list, not only the sidebar's: the strip under the editor is
+--- clicked the same way.
+function M.click_picker_list(picker, mouse)
   local list = picker and not picker.closed and picker.list or nil
-  if not list or not list.win or not list.win:valid() or mouse.winid ~= list.win.win then
+  if not list or not list.win or not list.win:valid() or not mouse or mouse.winid ~= list.win.win then
     return false
   end
   local line = mouse.line
@@ -1388,6 +1389,11 @@ function M._handle_list_click(mouse)
     picker:action("confirm")
   end)
   return true
+end
+
+function M._handle_list_click(mouse)
+  local state = state_for(tab_for_win(mouse and mouse.winid), false)
+  return M.click_picker_list(state and state.content and state.content.picker or nil, mouse)
 end
 
 function M._handle_mouse(mouse)
@@ -1692,6 +1698,10 @@ function M.setup()
     if M._handle_list_click(mouse) then
       return ""
     end
+    local find = package.loaded["config.find_in_file"]
+    if find and find.handle_mouse and find.handle_mouse(mouse) then
+      return ""
+    end
     -- Let a press in the terminal leave Terminal-Insert first, so the click
     -- positions the cursor and a drag anchors where it was aimed. Typing
     -- resumes on the release, once it is clear nothing was selected.
@@ -1877,6 +1887,7 @@ _G.ActivityBarSearchHiddenClick = function(minwid, _, button)
 end
 
 M._sync_tabline_offset = sync_tabline_offset
+M.disable_selection_gestures = disable_selection_gestures
 M._states = states
 M._available_width = available_width
 M._content_root = content_root
