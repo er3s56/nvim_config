@@ -29,7 +29,7 @@ local UNMERGED = {
 }
 
 local function run(root, args, opts, callback)
-  local cmd = { "git", "--no-optional-locks", "-C", root }
+  local cmd = { "git", "--no-optional-locks", "--literal-pathspecs", "-C", root }
   vim.list_extend(cmd, args)
   opts = vim.tbl_extend("keep", opts or {}, { text = true })
   vim.system(cmd, opts, function(result)
@@ -122,7 +122,7 @@ function M.split_lines(content)
   if trailing then
     content = content:sub(1, -2)
   end
-  if content == "" then
+  if content == "" and not trailing then
     return {}, trailing
   end
   return vim.split(content, "\n", { plain = true }), trailing
@@ -226,17 +226,29 @@ end
 -- ── repository reads ────────────────────────────────────────────────────
 
 function M.read_worktree(root, path)
-  local file = io.open(vim.fs.joinpath(root, path), "rb")
+  local full = vim.fs.joinpath(root, path)
+  local stat, stat_err = uv.fs_lstat(full)
+  if not stat then
+    if stat_err and stat_err:match("^ENOENT:") then
+      return ""
+    end
+    return nil, stat_err or ("Cannot stat `%s`"):format(path)
+  end
+  if stat.type ~= "file" then
+    return nil, ("`%s` is a %s; only whole-file operations are available"):format(path, stat.type)
+  end
+  local file = io.open(full, "rb")
   if not file then
     return nil, ("Cannot read `%s` from the working tree"):format(path)
   end
-  local content = file:read("*a")
+  local content, err = file:read("*a")
   file:close()
-  return content or ""
+  return content, err
 end
 
-local function read_blob(root, spec, callback)
-  run(root, { "show", spec }, { text = false }, function(result)
+local function read_blob(root, spec, callback, filtered_path)
+  local args = filtered_path and { "cat-file", "--filters", "--path=" .. filtered_path, spec } or { "show", spec }
+  run(root, args, { text = false }, function(result)
     if result.code ~= 0 then
       return callback(nil, vim.trim(result.stderr or ""))
     end
@@ -247,7 +259,7 @@ end
 -- The index side of a path, or an empty string when the path is not in the
 -- index at all -- a file staged for the first time has no previous version,
 -- which is not an error.
-local function read_index(root, path, callback)
+local function read_index(root, path, callback, filtered)
   read_blob(root, ":" .. path, function(content, err)
     if content then
       return callback(content)
@@ -258,58 +270,135 @@ local function read_index(root, path, callback)
       end
       callback("")
     end)
-  end)
+  end, filtered and path or nil)
 end
 
-local function read_head(root, path, callback)
-  read_blob(root, "HEAD:" .. path, function(content)
-    callback(content or "")
+-- A symlink blob contains a path, not the bytes of the file it points at.
+-- Check both Git modes and lstat: a regular working file may still be replacing
+-- a symlink in the index/HEAD, and an unresolved merge has no stage-zero blob.
+function M.check_hunk_file(root, path, opts, callback)
+  opts = opts or {}
+  local stat, stat_err = uv.fs_lstat(vim.fs.joinpath(root, path))
+  if not stat and stat_err and not stat_err:match("^ENOENT:") then
+    return callback(nil, stat_err)
+  end
+  if stat and stat.type ~= "file" then
+    return callback(nil, ("`%s` is a %s; only whole-file operations are available"):format(path, stat.type))
+  end
+  local info = { disk = stat, before_path = opts.before_path or path }
+  local function regular(mode)
+    return mode == nil or mode == "100644" or mode == "100755"
+  end
+  run(root, { "ls-files", "--stage", "-z", "--", path }, { text = false }, function(result)
+    if result.code ~= 0 then
+      return callback(nil, failure({ "ls-files" }, result))
+    end
+    for _, record in ipairs(vim.split(result.stdout or "", "\0", { plain = true, trimempty = true })) do
+      local mode, stage = record:match("^(%d+) %x+ (%d+)\t")
+      if stage ~= "0" or not regular(mode) then
+        return callback(
+          nil,
+          "`" .. path .. "` is not a regular stage-zero file; only whole-file operations are available"
+        )
+      end
+      info.index_mode = mode
+    end
+    if not opts.staged then
+      return callback(info)
+    end
+    run(root, { "rev-parse", "--verify", "--quiet", "HEAD" }, {}, function(head)
+      if head.code ~= 0 then
+        -- An unborn repository has no HEAD; other failures must be reported.
+        if head.code == 1 then
+          return callback(info)
+        end
+        return callback(nil, failure({ "rev-parse" }, head))
+      end
+      info.head = vim.trim(head.stdout or "")
+      run(root, { "ls-tree", "-z", info.head, "--", info.before_path }, { text = false }, function(tree)
+        if tree.code ~= 0 then
+          return callback(nil, failure({ "ls-tree" }, tree))
+        end
+        info.head_mode = (tree.stdout or ""):match("^(%d+)")
+        if not regular(info.head_mode) then
+          return callback(
+            nil,
+            "`" .. path .. "` was not a regular file in HEAD; only whole-file operations are available"
+          )
+        end
+        callback(info)
+      end)
+    end)
   end)
 end
 
 -- ── repository writes ───────────────────────────────────────────────────
 
-local function write_worktree(root, path, content)
+local function write_worktree(root, path, content, expected_stat, mode)
   local full = vim.fs.joinpath(root, path)
-  local file, err = io.open(full, "wb")
-  if not file then
+  if not expected_stat then
+    vim.fn.mkdir(vim.fs.dirname(full), "p")
+  end
+  -- Do not truncate on open. A link swapped into the path while git was
+  -- running must be rejected before a byte of its target can be changed.
+  local fd, err = uv.fs_open(full, expected_stat and "r+" or "wx", mode == "100755" and 493 or 438)
+  if not fd then
     return ("Cannot write `%s`: %s"):format(path, tostring(err))
   end
-  local ok, write_err = file:write(content)
-  file:close()
-  if not ok then
-    return ("Cannot write `%s`: %s"):format(path, tostring(write_err))
+  local opened, current = uv.fs_fstat(fd), uv.fs_lstat(full)
+  if
+    not opened
+    or not current
+    or current.type ~= "file"
+    or opened.ino ~= current.ino
+    or opened.dev ~= current.dev
+    or expected_stat and (opened.ino ~= expected_stat.ino or opened.dev ~= expected_stat.dev)
+  then
+    uv.fs_close(fd)
+    return "`" .. path .. "` changed type or was replaced; refresh the diff before retrying"
+  end
+  local offset = 0
+  while offset < #content do
+    local written, write_err = uv.fs_write(fd, content:sub(offset + 1), offset)
+    if not written or written == 0 then
+      uv.fs_close(fd)
+      return ("Cannot write `%s`: %s"):format(path, tostring(write_err))
+    end
+    offset = offset + written
+  end
+  local ok, truncate_err = uv.fs_ftruncate(fd, #content)
+  local closed, close_err = uv.fs_close(fd)
+  if not ok or not closed then
+    return ("Cannot finish writing `%s`: %s"):format(path, tostring(truncate_err or close_err))
   end
 end
 
--- The mode to record for a path. An entry already in the index keeps the mode
--- it has; a new one takes the executable bit from the file on disk, the way
--- `git add` would.
-local function index_mode(root, path, callback)
-  run(root, { "ls-files", "--stage", "--", path }, {}, function(result)
-    local mode = result.code == 0 and (result.stdout or ""):match("^(%d+)") or nil
-    if mode then
-      return callback(mode)
+local function stage_content(root, path, content, info, clean, callback)
+  -- Removing the only hunk of a new file unstages the path itself. Likewise,
+  -- staging a deleted file must remove its entry, not stage an empty file.
+  if content == "" and (clean and not info.disk or not clean and not info.head_mode) then
+    local args = { "update-index", "--force-remove", "--", path }
+    return run(root, args, {}, function(result)
+      report(callback, args, result)
+    end)
+  end
+  local mode = info.index_mode
+    or info.head_mode
+    or (uv.fs_access(vim.fs.joinpath(root, path), "X") and "100755" or "100644")
+  -- Stage from worktree form through this path's clean/eol rules. Unstaging
+  -- starts with canonical index blobs, so applying clean a second time is wrong.
+  local args = { "hash-object", "-w", "--stdin", clean and ("--path=" .. path) or "--no-filters" }
+  run(root, args, { stdin = content, text = false }, function(hashed)
+    if hashed.code ~= 0 then
+      return callback(failure({ "hash-object" }, hashed))
     end
-    local executable = uv.fs_access(vim.fs.joinpath(root, path), "X")
-    callback(executable and "100755" or "100644")
-  end)
-end
-
-local function stage_content(root, path, content, callback)
-  index_mode(root, path, function(mode)
-    run(root, { "hash-object", "-w", "--stdin" }, { stdin = content }, function(hashed)
-      if hashed.code ~= 0 then
-        return callback(failure({ "hash-object" }, hashed))
-      end
-      local sha = vim.trim(hashed.stdout or "")
-      if not sha:match("^%x+$") then
-        return callback("git hash-object returned no object name")
-      end
-      local args = { "update-index", "--add", "--cacheinfo", ("%s,%s,%s"):format(mode, sha, path) }
-      run(root, args, {}, function(result)
-        report(callback, args, result)
-      end)
+    local sha = vim.trim(hashed.stdout or "")
+    if not sha:match("^%x+$") then
+      return callback("git hash-object returned no object name")
+    end
+    local args = { "update-index", "--add", "--cacheinfo", ("%s,%s,%s"):format(mode, sha, path) }
+    run(root, args, {}, function(result)
+      report(callback, args, result)
     end)
   end)
 end
@@ -403,64 +492,82 @@ end
 -- would land in the wrong place. Refusing and refreshing is the only safe
 -- answer.
 local function with_sides(root, path, mode, expected, callback)
-  local read_before = mode == "staged" and read_head or read_index
-  local function verify(before, after)
-    if before ~= expected.before or after ~= expected.after then
-      return callback(nil, nil, "`" .. path .. "` changed since this diff was opened; the panel has been refreshed")
-    end
-    if M.is_binary(before) or M.is_binary(after) then
-      return callback(nil, nil, "`" .. path .. "` is binary; only whole-file operations are available")
-    end
-    callback(before, after)
-  end
+  M.check_hunk_file(
+    root,
+    path,
+    { staged = mode == "staged", before_path = expected.before_path },
+    function(info, type_err)
+      if type_err then
+        return callback(nil, nil, type_err)
+      end
+      local function read_before(done)
+        if mode == "staged" then
+          if not info.head_mode then
+            return done("")
+          end
+          return read_blob(root, info.head .. ":" .. info.before_path, done)
+        end
+        return read_index(root, path, done, true)
+      end
+      local function verify(before, after)
+        if before ~= expected.before or after ~= expected.after then
+          return callback(nil, nil, "`" .. path .. "` changed since this diff was opened; the panel has been refreshed")
+        end
+        if M.is_binary(before) or M.is_binary(after) then
+          return callback(nil, nil, "`" .. path .. "` is binary; only whole-file operations are available")
+        end
+        callback(before, after, nil, info)
+      end
 
-  read_before(root, path, function(before, err)
-    if not before then
-      return callback(nil, nil, err or ("Cannot read the previous version of `" .. path .. "`"))
-    end
-    if mode == "staged" then
-      return read_index(root, path, function(after, index_err)
+      read_before(function(before, err)
+        if not before then
+          return callback(nil, nil, err or ("Cannot read the previous version of `" .. path .. "`"))
+        end
+        if mode == "staged" then
+          return read_index(root, path, function(after, index_err)
+            if not after then
+              return callback(nil, nil, index_err or ("Cannot read the staged version of `" .. path .. "`"))
+            end
+            verify(before, after)
+          end)
+        end
+        local after, read_err = M.read_worktree(root, path)
         if not after then
-          return callback(nil, nil, index_err or ("Cannot read the staged version of `" .. path .. "`"))
+          return callback(nil, nil, read_err)
         end
         verify(before, after)
       end)
     end
-    local after, read_err = M.read_worktree(root, path)
-    if not after then
-      return callback(nil, nil, read_err)
-    end
-    verify(before, after)
-  end)
+  )
 end
 
 --- Stage one hunk of a file's unstaged (or untracked) changes.
 function M.stage_hunk(root, path, hunk, expected, callback)
-  with_sides(root, path, "unstaged", expected, function(before, after, err)
+  with_sides(root, path, "unstaged", expected, function(before, after, err, info)
     if err then
       return callback(err)
     end
-    stage_content(root, path, M.apply_hunk(before, after, hunk), callback)
+    stage_content(root, path, M.apply_hunk(before, after, hunk), info, true, callback)
   end)
 end
 
 --- Take one hunk back out of the index, leaving the rest staged.
 function M.unstage_hunk(root, path, hunk, expected, callback)
-  with_sides(root, path, "staged", expected, function(before, after, err)
+  with_sides(root, path, "staged", expected, function(before, after, err, info)
     if err then
       return callback(err)
     end
-    stage_content(root, path, M.revert_hunk(before, after, hunk), callback)
+    stage_content(root, path, M.revert_hunk(before, after, hunk), info, false, callback)
   end)
 end
 
 --- Throw away one hunk of a file's unstaged changes.
 function M.discard_hunk(root, path, hunk, expected, callback)
-  with_sides(root, path, "unstaged", expected, function(before, after, err)
+  with_sides(root, path, "unstaged", expected, function(before, after, err, info)
     if err then
       return callback(err)
     end
-    callback(write_worktree(root, path, M.revert_hunk(before, after, hunk)))
+    callback(write_worktree(root, path, M.revert_hunk(before, after, hunk), info.disk, info.index_mode))
   end)
 end
 

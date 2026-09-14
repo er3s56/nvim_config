@@ -1948,7 +1948,7 @@ end
 local function hunks_describe_screen(preview)
   -- A side that was never read has no lines to stage: what is in the buffer
   -- is a sentence about the file, not the file.
-  if preview.skipped then
+  if preview.skipped or preview.hunk_error then
     return false
   end
   -- Nor while the file has unsaved changes. The hunks are computed from what
@@ -2166,7 +2166,8 @@ local function show_preview(state, entry, key, before, after, specs, focus_previ
   -- index, a commit -- and stays a scratch buffer.
   local after_buf, after_is_file, after_buf_ours
   local worktree = specs.after_worktree and not specs.skipped and workspace_path(state, entry) or nil
-  if worktree and workspace_file_exists(worktree) then
+  local worktree_stat = worktree and vim.uv.fs_lstat(worktree)
+  if worktree_stat and worktree_stat.type == "file" then
     -- Whether the reader already had this file open decides who cleans it up.
     after_buf_ours = vim.fn.bufexists(worktree) == 0
     after_buf = vim.fn.bufadd(worktree)
@@ -2185,6 +2186,7 @@ local function show_preview(state, entry, key, before, after, specs, focus_previ
     views = {},
     mode = specs.mode,
     skipped = specs.skipped,
+    hunk_error = specs.hunk_error,
     after_is_file = after_is_file,
     after_buf_ours = after_is_file and after_buf_ours or nil,
     before = before,
@@ -2278,6 +2280,17 @@ end
 
 local function read_worktree(root, path, callback)
   local full = vim.fs.joinpath(root, path)
+  local kind = vim.uv.fs_lstat(full)
+  if kind and kind.type == "link" then
+    local target, err = vim.uv.fs_readlink(full)
+    return vim.schedule(function()
+      callback(target or "", target and 0 or 1, err or "")
+    end)
+  elseif kind and kind.type ~= "file" then
+    return vim.schedule(function()
+      callback("", 0, "", "Filesystem " .. kind.type .. " — only whole-file operations are available.")
+    end)
+  end
   local reason, stat = BinaryFiles.reason(full, { limit = PREVIEW_LIMIT })
   if reason then
     -- Not read at all: the whole point is to never hold it.
@@ -2288,7 +2301,7 @@ local function read_worktree(root, path, callback)
   run({ "cat", "--", full }, callback, false)
 end
 
-local function read_blob(root, spec, callback)
+local function read_blob(root, spec, callback, filtered_path)
   if not spec then
     vim.schedule(function()
       callback("", 0)
@@ -2302,7 +2315,8 @@ local function read_blob(root, spec, callback)
     if code == 0 and size and size > PREVIEW_LIMIT then
       return callback("", 0, "", unshowable("large", size))
     end
-    run_git(root, { "show", spec }, callback, false)
+    local args = filtered_path and { "cat-file", "--filters", "--path=" .. filtered_path, spec } or { "show", spec }
+    run_git(root, args, callback, false)
   end)
 end
 
@@ -2382,7 +2396,16 @@ local function read_sides(root, path, specs, callback)
   local before_done, after_done = false, false
   local function finish()
     if before_done and after_done then
-      callback(before, after, failure, skipped)
+      if specs.mode == "commit" or failure or skipped then
+        return callback(before, after, failure, skipped)
+      end
+      GitOps.check_hunk_file(root, path, {
+        staged = specs.mode == "staged",
+        before_path = specs.before_path,
+      }, function(_, err)
+        specs.hunk_error = err
+        callback(before, after, failure, skipped)
+      end)
     end
   end
   local function receive(side)
@@ -2408,7 +2431,7 @@ local function read_sides(root, path, specs, callback)
   if specs.before_worktree then
     read_worktree(root, specs.before_worktree, receive("before"))
   else
-    read_blob(root, specs.before_spec, receive("before"))
+    read_blob(root, specs.before_spec, receive("before"), specs.mode == "unstaged" and path or nil)
   end
   if specs.after_worktree then
     read_worktree(root, specs.after_worktree, receive("after"))
@@ -2482,11 +2505,13 @@ function reload_preview(state, preview, entry)
     local changed = preview.before ~= before
       or preview.after ~= after
       or preview.mode ~= specs.mode
+      or preview.hunk_error ~= specs.hunk_error
       or preview.drawn_modified ~= modified
     preview.drawn_modified = modified
     preview.entry = entry
     preview.mode = specs.mode
     preview.skipped = specs.skipped
+    preview.hunk_error = specs.hunk_error
     preview.before, preview.after = before, after
     preview.before_label, preview.after_label = specs.before_label, specs.after_label
     if not changed then
@@ -2879,7 +2904,7 @@ local function run_hunk_action(state, preview, name, hunk)
   local entry = preview.entry
   -- The diff the reader is looking at is what the hunk's line numbers mean, so
   -- it is what git_ops checks the repository against before writing anything.
-  local expected = { before = preview.before, after = preview.after }
+  local expected = { before = preview.before, after = preview.after, before_path = entry.old_path }
   local buf = state.buf
   local function finished(err)
     if err then
