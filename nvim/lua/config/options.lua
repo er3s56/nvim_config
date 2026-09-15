@@ -16,6 +16,18 @@
 vim.g.mapleader = "\\"
 vim.g.maplocalleader = ","
 
+-- The project is the directory Neovim was started in, the way an editor's
+-- workspace is the folder that was opened. LazyVim would rather guess: the
+-- root the language server reports, else the nearest `.git` or `lua` directory
+-- upward, else the cwd -- and every panel here (sidebar, terminal, Git) asks
+-- it. The guess is fragile in ways the panels then show: any entry named
+-- `.git` counts, valid repository or not, and the search does not stop at the
+-- home directory, so an empty `~/.git` sent every project without one of its
+-- own to `~`. A language server with its own idea of a root moves the sidebar
+-- without saying why. The cwd is what was asked for, and it is what all the
+-- panels now agree on.
+vim.g.root_spec = { "cwd" }
+
 -- Keep editor line numbers stable when the cursor moves. LazyVim enables
 -- relative numbers by default, which makes every number except the current
 -- line represent a distance rather than the file's actual line number.
