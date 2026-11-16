@@ -2198,27 +2198,6 @@ local function show_preview(state, entry, key, before, after, specs, focus_previ
   prepare_hunks(preview)
   render_hunk_buttons(state, preview)
 
-  for _, buf in ipairs(preview.bufs) do
-    vim.keymap.set("n", "<ScrollWheelDown>", function()
-      return diff_scroll_rhs(state, 1)
-    end, {
-      buffer = buf,
-      expr = true,
-      replace_keycodes = true,
-      silent = true,
-      desc = "Scroll both Git diff windows down",
-    })
-    vim.keymap.set("n", "<ScrollWheelUp>", function()
-      return diff_scroll_rhs(state, -1)
-    end, {
-      buffer = buf,
-      expr = true,
-      replace_keycodes = true,
-      silent = true,
-      desc = "Scroll both Git diff windows up",
-    })
-  end
-
   if after_is_file then
     -- The working tree changed without `.git` changing, so nothing else would
     -- notice: the watcher only sees the repository. Refreshing re-reads the
@@ -2741,6 +2720,14 @@ local function mouse_preview_target()
       if layout and (mouse.winid == layout.main_win or mouse.winid == layout.after_win) then
         return state
       end
+    end
+  end
+  -- Switching the sidebar leaves the diff visible with no live Git panel.
+  -- Keep both sides synchronized, including an empty side of an added file.
+  for _, state in pairs(retained) do
+    local layout = state.preview_layout
+    if layout and (mouse.winid == layout.main_win or mouse.winid == layout.after_win) then
+      return state
     end
   end
 end
@@ -3395,6 +3382,8 @@ local function setup_global_mouse_mappings()
     return swallow_outside_panel(mouse, "<LeftRelease>")
   end, { expr = true, silent = true, desc = "Finish Git panel click" })
 
+  -- Route by the hovered window: buffer mappings would capture a stale panel
+  -- after its preview is retained/adopted and swallow ordinary file scrolling.
   -- This is also the synchronisation path when the mouse is over a diff that
   -- does not own focus. Do not add a WinScrolled callback that enters the
   -- source window with nvim_win_call(): Snacks can then re-evaluate its main
