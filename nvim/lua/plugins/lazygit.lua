@@ -214,6 +214,9 @@ return {
       -- Keep Bufferline's scheduled command path so real mouse clicks also
       -- trigger its normal UI refresh after the central editor is updated.
       opts.options.left_mouse_command = "PanelBufferOpen %d"
+      opts.options.right_mouse_command = function(buf)
+        require("config.bufferline_menu").open(buf)
+      end
       -- Neovim's tabline spans the whole screen. Reserve the Activity Bar and
       -- the sidebar so buffer tabs begin above the central editor, the way an
       -- editor tab strip is expected to sit. Bufferline sizes an offset from

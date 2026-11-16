@@ -101,6 +101,27 @@ for _, label in ipairs({
   assert(labels[label], "missing menu entry: " .. label)
 end
 
+-- Both path actions preserve the multi-selection and omit a trailing newline.
+local setreg, project_root = vim.fn.setreg, LazyVim.root
+local copied
+vim.fn.setreg = function(register, text, kind)
+  copied = { register, text, kind }
+end
+LazyVim.root = function()
+  return nil -- Fall back to the Explorer's project directory.
+end
+for _, entry in ipairs(Menu._entries_for(selected)) do
+  if entry.label == "Copy Absolute Path" then
+    entry.action()
+    assert_equal({ "+", "/project/file.txt\n/project/folder", "c" }, copied, "absolute selection copy changed")
+  elseif entry.label == "Copy Relative Path" then
+    entry.action()
+    assert_equal({ "+", "file.txt\nfolder", "c" }, copied, "relative selection copy changed")
+  end
+end
+vim.fn.setreg, LazyVim.root = setreg, project_root
+assert_equal({ "/project/file.txt", "/project/folder" }, selected.paths, "copying mutated the selected paths")
+
 Menu._open(Menu._entries_for(blank), { screenrow = 1, screencol = 1 })
 assert_equal("explorer_context_menu", vim.bo.filetype, "context menu float did not open")
 Menu._close()

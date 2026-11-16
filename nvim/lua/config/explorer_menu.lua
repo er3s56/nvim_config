@@ -4,6 +4,7 @@ local FileOps = require("config.explorer_file_ops")
 local Platform = require("config.explorer_platform")
 local ContextMenu = require("config.context_menu")
 local Pinned = require("config.pinned")
+local ProjectPaths = require("config.project_paths")
 
 local M = {}
 
@@ -266,39 +267,6 @@ local function paste_files(ctx)
   )
 end
 
-local function copy_text(paths, label)
-  -- Charwise, not linewise: a linewise register carries a trailing newline
-  -- into the system clipboard, and under WSL that clipboard is the Windows
-  -- one -- so a copied path pasted at a shell prompt runs the moment it
-  -- lands. Several paths still arrive one per line; only the trailing
-  -- newline goes away.
-  local ok, err = pcall(vim.fn.setreg, "+", table.concat(paths, "\n"), "c")
-  if not ok then
-    error_message(("Failed to copy %s:\n%s"):format(label, err or "unknown error"))
-    return
-  end
-  info(("Copied %s"):format(label))
-end
-
-local function project_root(picker)
-  if rawget(_G, "LazyVim") and LazyVim.root then
-    local ok, root = pcall(LazyVim.root)
-    if ok and root then
-      return vim.fs.normalize(root)
-    end
-  end
-  return vim.fs.normalize(picker:cwd())
-end
-
-local function relative_paths(ctx)
-  local root = project_root(ctx.picker)
-  local paths = {}
-  for _, path in ipairs(ctx.paths) do
-    paths[#paths + 1] = vim.fs.relpath(root, path) or path
-  end
-  copy_text(paths, "project-relative path")
-end
-
 local function open_item(ctx)
   if not (ctx.item and valid_picker(ctx.picker)) then
     return
@@ -406,7 +374,7 @@ local function delete_items(ctx)
 end
 
 local function all_pinned(ctx)
-  local root = project_root(ctx.picker)
+  local root = ProjectPaths.root(ctx.picker:cwd())
   for _, path in ipairs(ctx.paths) do
     if not Pinned.is_pinned(root, path) then
       return false
@@ -423,7 +391,7 @@ local function pinned_label(ctx)
 end
 
 local function toggle_pins(ctx)
-  local root = project_root(ctx.picker)
+  local root = ProjectPaths.root(ctx.picker:cwd())
   local unpinning = all_pinned(ctx)
   for _, path in ipairs(ctx.paths) do
     if unpinning then
@@ -492,14 +460,14 @@ local function entries_for(ctx)
       label = "Copy Absolute Path",
       enabled = has_paths,
       action = function()
-        copy_text(ctx.paths, "absolute path")
+        ProjectPaths.copy(ctx.paths)
       end,
     },
     {
       label = "Copy Relative Path",
       enabled = has_paths,
       action = function()
-        relative_paths(ctx)
+        ProjectPaths.copy(ctx.paths, { relative = true, cwd = ctx.picker:cwd() })
       end,
     },
     { separator = true },
